@@ -459,10 +459,10 @@ Authorization: Bearer ext-真实APIKey
 
 ### Docker 请求生命周期日志
 
-External HTTP 调用的新增生命周期日志只输出到后端容器 stdout，不写入新的请求日志表，也不提供日志查询 API。可通过下面的命令按请求 ID 排查：
+External HTTP 调用的新增生命周期日志只输出到后端容器 stdout，不写入新的请求日志表，也不提供日志查询 API。请从 Compose 项目目录运行下面的命令，按请求 ID 排查：
 
 ```bash
-docker logs clawith-backend 2>&1 | grep 'request_id="225e7600-8247-46ae-8fbe-df29f5951c8d"'
+docker compose logs backend 2>&1 | grep 'request_id="225e7600-8247-46ae-8fbe-df29f5951c8d"'
 ```
 
 事件包括 `received`、`validated`、`accepted`、`processing`、`completed`、`rejected`、`timeout` 和 `failed`。长时间推理每 30 秒输出一次 `processing` 心跳。
