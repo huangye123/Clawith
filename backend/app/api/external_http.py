@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -206,6 +206,19 @@ class ExternalHttpMessageIn(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=255)
     metadata: dict[str, Any] | None = None
     mode: str = Field(default="sync", pattern="^(sync|async)$")
+
+
+_EXTERNAL_HTTP_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _log_rejected(state: ExternalHttpRequestState, exc: HTTPException) -> None:
+    _log_external_http_event(
+        "WARNING",
+        "rejected",
+        state,
+        status_code=exc.status_code,
+        reason="expected_http_error",
+    )
 
 
 def _hash_secret(value: str) -> str:
@@ -443,6 +456,96 @@ async def _process_external_http_message(
     }
 
 
+async def _run_sync_external_http(
+    *,
+    state: ExternalHttpRequestState,
+    message: ExternalHttpMessageIn,
+    timeout_seconds: float,
+    heartbeat_interval: float = PROCESSING_HEARTBEAT_SECONDS,
+) -> dict | JSONResponse:
+    try:
+        result = await _run_with_heartbeat(
+            _process_external_http_message(
+                agent_id=state.agent_id,
+                message=message,
+                request_id=state.request_id,
+                state=state,
+            ),
+            state=state,
+            timeout_seconds=timeout_seconds,
+            heartbeat_interval=heartbeat_interval,
+        )
+    except TimeoutError:
+        _log_external_http_event("ERROR", "timeout", state, status_code=504, reason="Agent processing timed out")
+        return _public_error_response(state, "Agent processing timed out", status_code=504)
+    except HTTPException as exc:
+        _log_rejected(state, exc)
+        raise
+    except asyncio.CancelledError:
+        _log_external_http_event("WARNING", "failed", state, reason="request_cancelled")
+        raise
+    except Exception as exc:
+        _log_unexpected_failure(state, exc)
+        return _public_error_response(state, _public_reason(exc), status_code=500)
+
+    state.stage = "completed"
+    _log_external_http_event("INFO", "completed", state, status_code=200, session_id=result.get("session_id"))
+    return result
+
+
+async def _run_async_external_http(
+    *,
+    state: ExternalHttpRequestState,
+    message: ExternalHttpMessageIn,
+    timeout_seconds: float = ASYNC_PROCESSING_TIMEOUT_SECONDS,
+    heartbeat_interval: float = PROCESSING_HEARTBEAT_SECONDS,
+) -> None:
+    try:
+        result = await _run_with_heartbeat(
+            _process_external_http_message(
+                agent_id=state.agent_id,
+                message=message,
+                request_id=state.request_id,
+                state=state,
+            ),
+            state=state,
+            timeout_seconds=timeout_seconds,
+            heartbeat_interval=heartbeat_interval,
+        )
+    except TimeoutError:
+        _log_external_http_event("ERROR", "timeout", state, reason="Agent processing timed out")
+        return
+    except HTTPException as exc:
+        _log_rejected(state, exc)
+        return
+    except asyncio.CancelledError:
+        _log_external_http_event("WARNING", "failed", state, reason="request_cancelled")
+        raise
+    except Exception as exc:
+        _log_unexpected_failure(state, exc)
+        return
+
+    state.stage = "completed"
+    _log_external_http_event("INFO", "completed", state, status_code=200, session_id=result.get("session_id"))
+
+
+def _consume_external_http_background_task(task: asyncio.Task[None]) -> None:
+    _EXTERNAL_HTTP_BACKGROUND_TASKS.discard(task)
+    if not task.cancelled():
+        task.exception()
+
+
+def _start_external_http_background_task(
+    *,
+    state: ExternalHttpRequestState,
+    message: ExternalHttpMessageIn,
+) -> asyncio.Task[None]:
+    task = asyncio.create_task(_run_async_external_http(state=state, message=message))
+    _EXTERNAL_HTTP_BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_consume_external_http_background_task)
+    return task
+
+
 @router.post("/agents/{agent_id}/external-http-channel", status_code=status.HTTP_201_CREATED)
 async def configure_external_http_channel(
     agent_id: uuid.UUID,
@@ -573,65 +676,75 @@ async def external_http_message(
     agent_id: uuid.UUID,
     request: Request,
 ):
-    async with async_session() as db:
-        result = await db.execute(
-            select(ChannelConfig).where(
-                ChannelConfig.agent_id == agent_id,
-                ChannelConfig.channel_type == CHANNEL_TYPE,
-                ChannelConfig.is_configured == True,  # noqa: E712
+    state = ExternalHttpRequestState(request_id=str(uuid.uuid4()), agent_id=agent_id)
+    _log_external_http_event("INFO", "received", state)
+
+    try:
+        async with async_session() as db:
+            result = await db.execute(
+                select(ChannelConfig).where(
+                    ChannelConfig.agent_id == agent_id,
+                    ChannelConfig.channel_type == CHANNEL_TYPE,
+                    ChannelConfig.is_configured == True,  # noqa: E712
+                )
             )
-        )
-        config = result.scalar_one_or_none()
-        if not config:
-            raise HTTPException(status_code=404, detail="External HTTP channel not configured")
+            config = result.scalar_one_or_none()
+            if not config:
+                raise HTTPException(status_code=404, detail="External HTTP channel not configured")
 
-        _verify_api_key(config, request)
+            _verify_api_key(config, request)
 
-        max_payload = int((config.extra_config or {}).get("max_payload_bytes") or DEFAULT_MAX_PAYLOAD_BYTES)
-        body = await request.body()
-        if len(body) > max_payload:
-            raise HTTPException(status_code=413, detail="Payload too large")
+            max_payload = int((config.extra_config or {}).get("max_payload_bytes") or DEFAULT_MAX_PAYLOAD_BYTES)
+            body = await request.body()
+            if len(body) > max_payload:
+                raise HTTPException(status_code=413, detail="Payload too large")
 
-        _verify_hmac_signature(config, request, body)
+            _verify_hmac_signature(config, request, body)
 
-        hit_count = await _record_and_count_hits(config)
-        from app.models.agent import Agent
+            hit_count = await _record_and_count_hits(config)
+            from app.models.agent import Agent
 
-        agent_r = await db.execute(select(Agent).where(Agent.id == agent_id))
-        agent = agent_r.scalar_one_or_none()
-        rate_limit = (agent.webhook_rate_limit if agent else None) or 5
-        timeout_seconds = int((config.extra_config or {}).get("sync_timeout_seconds") or DEFAULT_SYNC_TIMEOUT_SECONDS)
-        if hit_count > rate_limit:
-            raise HTTPException(status_code=429, detail="Rate limit exceeded")
+            agent_r = await db.execute(select(Agent).where(Agent.id == agent_id))
+            agent = agent_r.scalar_one_or_none()
+            rate_limit = (agent.webhook_rate_limit if agent else None) or 5
+            if hit_count > rate_limit:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-    try:
-        payload = ExternalHttpMessageIn.model_validate_json(body)
+            timeout_seconds = max(
+                5,
+                min(
+                    300,
+                    int((config.extra_config or {}).get("sync_timeout_seconds") or DEFAULT_SYNC_TIMEOUT_SECONDS),
+                ),
+            )
+
+        try:
+            payload = ExternalHttpMessageIn.model_validate_json(body)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid request body: {exc}") from None
+    except HTTPException as exc:
+        _log_rejected(state, exc)
+        raise
+    except asyncio.CancelledError:
+        _log_external_http_event("WARNING", "failed", state, reason="request_cancelled")
+        raise
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid request body: {exc}") from None
+        _log_unexpected_failure(state, exc)
+        return _public_error_response(state, "Internal processing failed", status_code=500)
 
-    request_id = str(uuid.uuid4())
+    state.mode = payload.mode
+    state.payload_bytes = len(body)
+    state.stage = "validated"
+    _log_external_http_event("INFO", "validated", state)
+
     if payload.mode == "async":
-        task = asyncio.create_task(
-            _process_external_http_message(agent_id=agent_id, message=payload, request_id=request_id)
-        )
+        state.stage = "accepted"
+        _start_external_http_background_task(state=state, message=payload)
+        _log_external_http_event("INFO", "accepted", state, status_code=200)
+        return {"ok": True, "status": "accepted", "request_id": state.request_id}
 
-        def _log_background_result(done_task: asyncio.Task) -> None:
-            try:
-                done_task.result()
-            except Exception as exc:
-                logger.error(f"[ExternalHTTP] Async request {request_id} failed: {exc}")
-
-        task.add_done_callback(_log_background_result)
-        return {"ok": True, "status": "accepted", "request_id": request_id}
-
-    try:
-        return await asyncio.wait_for(
-            _process_external_http_message(agent_id=agent_id, message=payload, request_id=request_id),
-            timeout=timeout_seconds,
-        )
-    except asyncio.TimeoutError:
-        return Response(
-            content=json.dumps({"ok": False, "request_id": request_id, "error": "Timed out"}),
-            media_type="application/json",
-            status_code=504,
-        )
+    return await _run_sync_external_http(
+        state=state,
+        message=payload,
+        timeout_seconds=timeout_seconds,
+    )

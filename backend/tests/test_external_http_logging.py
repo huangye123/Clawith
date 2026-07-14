@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -271,3 +272,207 @@ async def test_runner_propagates_caller_cancellation():
     with pytest.raises(asyncio.CancelledError):
         await runner
     assert operation_cancelled.is_set()
+
+
+async def test_sync_orchestrator_returns_success_and_logs_completion(monkeypatch, log_messages):
+    state = make_state()
+    message = external_http.ExternalHttpMessageIn(content="secret content")
+
+    async def process(**_kwargs):
+        return {"ok": True, "request_id": "req-123", "session_id": "session-1", "reply": "done"}
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", process)
+    result = await external_http._run_sync_external_http(
+        state=state,
+        message=message,
+        timeout_seconds=1.0,
+        heartbeat_interval=1.0,
+    )
+
+    assert result["reply"] == "done"
+    output = "\n".join(log_messages)
+    assert 'event="completed"' in output
+    assert 'session_id="session-1"' in output
+    assert "secret content" not in output
+
+
+async def test_sync_orchestrator_returns_sanitized_500(monkeypatch, log_messages):
+    state = make_state()
+    message = external_http.ExternalHttpMessageIn(content="secret content")
+
+    async def fail(**_kwargs):
+        try:
+            raise RuntimeError("provider-internal-detail")
+        except RuntimeError as cause:
+            raise external_http.ExternalHttpProcessingError(
+                "agent_inference",
+                "Agent inference failed",
+            ) from cause
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", fail)
+    response = await external_http._run_sync_external_http(
+        state=state,
+        message=message,
+        timeout_seconds=1.0,
+        heartbeat_interval=1.0,
+    )
+
+    assert response.status_code == 500
+    assert json.loads(response.body) == {
+        "ok": False,
+        "request_id": "req-123",
+        "error": "Agent inference failed",
+    }
+    assert b"provider-internal-detail" not in response.body
+    assert 'event="failed"' in "\n".join(log_messages)
+
+
+async def test_sync_orchestrator_returns_504_and_cancels(monkeypatch, log_messages):
+    state = make_state()
+    message = external_http.ExternalHttpMessageIn(content="secret content")
+    cancelled = asyncio.Event()
+
+    async def hang(**_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", hang)
+    response = await external_http._run_sync_external_http(
+        state=state,
+        message=message,
+        timeout_seconds=0.01,
+        heartbeat_interval=1.0,
+    )
+
+    assert response.status_code == 504
+    assert json.loads(response.body)["error"] == "Agent processing timed out"
+    assert cancelled.is_set()
+    assert 'event="timeout"' in "\n".join(log_messages)
+
+
+async def test_async_orchestrator_times_out_and_consumes_failure(monkeypatch, log_messages):
+    state = make_state(mode="async")
+    message = external_http.ExternalHttpMessageIn(content="secret content", mode="async")
+    cancelled = asyncio.Event()
+
+    async def hang(**_kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", hang)
+    await external_http._run_async_external_http(
+        state=state,
+        message=message,
+        timeout_seconds=0.01,
+        heartbeat_interval=1.0,
+    )
+
+    assert cancelled.is_set()
+    assert 'event="timeout"' in "\n".join(log_messages)
+
+
+async def test_background_task_is_owned_then_removed(monkeypatch):
+    state = make_state(mode="async")
+    message = external_http.ExternalHttpMessageIn(content="secret content", mode="async")
+    release = asyncio.Event()
+
+    async def process(**_kwargs):
+        await release.wait()
+        return {"ok": True, "session_id": "session-1"}
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", process)
+    task = external_http._start_external_http_background_task(state=state, message=message)
+    assert task in external_http._EXTERNAL_HTTP_BACKGROUND_TASKS
+
+    release.set()
+    await task
+    await asyncio.sleep(0)
+    assert task not in external_http._EXTERNAL_HTTP_BACKGROUND_TASKS
+
+
+async def test_endpoint_logs_received_and_validated_without_request_secrets(monkeypatch, log_messages):
+    agent_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    body = json.dumps(
+        {
+            "content": "private-message",
+            "external_user_id": "private-user",
+            "conversation_id": "private-conversation",
+            "metadata": {"secret": "metadata-secret"},
+            "mode": "sync",
+        }
+    ).encode()
+    config = SimpleNamespace(
+        agent_id=agent_id,
+        encrypt_key=None,
+        extra_config={
+            "api_key_hash": external_http._hash_secret("ext-secret-key"),
+            "require_hmac": False,
+            "max_payload_bytes": 65536,
+            "sync_timeout_seconds": 120,
+        },
+    )
+    agent = SimpleNamespace(webhook_rate_limit=5)
+
+    class FakeResult:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    class FakeSession:
+        def __init__(self):
+            self.values = iter((config, agent))
+
+        async def execute(self, _query):
+            return FakeResult(next(self.values))
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return FakeSession()
+
+        async def __aexit__(self, _exc_type, _exc, _tb):
+            return False
+
+    class FakeRequest:
+        headers = {"authorization": "Bearer ext-secret-key"}
+
+        async def body(self):
+            return body
+
+    captured_state = None
+
+    async def count_hits(_config):
+        return 1
+
+    async def run_sync(*, state, message, timeout_seconds, **_kwargs):
+        nonlocal captured_state
+        captured_state = state
+        assert message.mode == "sync"
+        assert timeout_seconds == 120
+        return {"ok": True, "request_id": state.request_id, "session_id": "session-1", "reply": "done"}
+
+    monkeypatch.setattr(external_http, "async_session", lambda: FakeSessionContext())
+    monkeypatch.setattr(external_http, "_record_and_count_hits", count_hits)
+    monkeypatch.setattr(external_http, "_run_sync_external_http", run_sync)
+
+    result = await external_http.external_http_message(agent_id, FakeRequest())
+
+    assert result["ok"] is True
+    assert captured_state is not None
+    output = "\n".join(log_messages)
+    assert 'event="received"' in output
+    assert 'event="validated"' in output
+    assert f'request_id="{captured_state.request_id}"' in output
+    for secret in (
+        "private-message",
+        "private-user",
+        "private-conversation",
+        "metadata-secret",
+        "ext-secret-key",
+    ):
+        assert secret not in output
