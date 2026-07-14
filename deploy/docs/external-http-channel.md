@@ -457,6 +457,30 @@ Authorization: Bearer ext-真实APIKey
 - 提高 `sync_timeout_seconds`。
 - 改用 `mode=async`。
 
+### Docker 请求生命周期日志
+
+External HTTP 调用的新增生命周期日志只输出到后端容器 stdout，不写入新的请求日志表，也不提供日志查询 API。可通过下面的命令按请求 ID 排查：
+
+```bash
+docker logs clawith-backend 2>&1 | grep 'request_id="225e7600-8247-46ae-8fbe-df29f5951c8d"'
+```
+
+事件包括 `received`、`validated`、`accepted`、`processing`、`completed`、`rejected`、`timeout` 和 `failed`。长时间推理每 30 秒输出一次 `processing` 心跳。
+
+日志不会记录消息正文、metadata、API Key、HMAC 签名、请求头、原始请求体、外部用户 ID 或外部会话 ID。
+
+同步调用继续使用渠道配置的 `sync_timeout_seconds`，范围为 5–300 秒，默认 120 秒。异步调用有固定 300 秒硬超时。任一模式超时后都会取消当前推理，不会自动重试或继续后台执行。
+
+未预期的同步错误返回简短脱敏原因和 `request_id`；完整诊断堆栈只出现在 Docker 日志中。例如：
+
+```json
+{
+  "ok": false,
+  "request_id": "225e7600-8247-46ae-8fbe-df29f5951c8d",
+  "error": "Agent inference failed"
+}
+```
+
 ## 10. 安全建议
 
 生产环境建议：
