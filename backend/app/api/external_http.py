@@ -8,12 +8,16 @@ import hmac
 import json
 import secrets
 import time
+import traceback
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
 from loguru import logger
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -64,6 +68,67 @@ class ExternalHttpRequestState:
 
     def elapsed_ms(self) -> int:
         return max(0, round((time.monotonic() - self.started_at) * 1000))
+
+
+class ExternalHttpProcessingError(Exception):
+    def __init__(self, stage: str, public_reason: str) -> None:
+        super().__init__(public_reason)
+        self.stage = stage
+        self.public_reason = public_reason
+
+
+@asynccontextmanager
+async def _processing_stage(
+    state: ExternalHttpRequestState,
+    stage: str,
+    public_reason: str,
+) -> AsyncIterator[None]:
+    state.stage = stage
+    try:
+        yield
+    except (HTTPException, asyncio.CancelledError, ExternalHttpProcessingError):
+        raise
+    except Exception as exc:
+        raise ExternalHttpProcessingError(stage, public_reason) from exc
+
+
+def _public_error_response(
+    state: ExternalHttpRequestState,
+    reason: str,
+    *,
+    status_code: int,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ok": False,
+            "request_id": state.request_id,
+            "error": reason,
+        },
+    )
+
+
+def _public_reason(exc: Exception) -> str:
+    if isinstance(exc, ExternalHttpProcessingError):
+        return exc.public_reason
+    return "Internal processing failed"
+
+
+def _log_unexpected_failure(state: ExternalHttpRequestState, exc: Exception) -> None:
+    root_exc = exc.__cause__ or exc
+    reason = _public_reason(exc)
+    _log_external_http_event(
+        "ERROR",
+        "failed",
+        state,
+        error_type=type(root_exc).__name__,
+        reason=reason,
+    )
+    trace = "".join(traceback.format_exception(type(root_exc), root_exc, root_exc.__traceback__))
+    try:
+        logger.error(f"[ExternalHTTP] traceback request_id={state.request_id!r}\n{trace}")
+    except Exception:
+        pass
 
 
 def _log_value(value: Any) -> str:
@@ -237,105 +302,108 @@ async def _process_external_http_message(
     agent_id: uuid.UUID,
     message: ExternalHttpMessageIn,
     request_id: str,
+    state: ExternalHttpRequestState,
 ) -> dict:
     from app.api.feishu import _call_llm_with_config, _load_agent_and_model
     from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
     from app.models.chat_session import ChatSession
     from app.services.activity_logger import log_activity
 
-    async with async_session() as db:
-        agent, model, fallback_model = await _load_agent_and_model(db, agent_id)
-        if not agent:
-            raise HTTPException(status_code=404, detail="Agent not found")
+    async with _processing_stage(state, "prepare_session", "Failed to prepare agent session"):
+        async with async_session() as db:
+            agent, model, fallback_model = await _load_agent_and_model(db, agent_id)
+            if not agent:
+                raise HTTPException(status_code=404, detail="Agent not found")
 
-        ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
-        external_user_id = message.external_user_id.strip()
-        external_name = (message.external_user_name or "").strip() or f"External User {external_user_id[:8]}"
-        platform_user = await channel_user_service.resolve_channel_user(
-            db=db,
-            agent=agent,
-            channel_type=CHANNEL_TYPE,
-            external_user_id=external_user_id,
-            extra_info={
-                "name": external_name,
-                "external_id": external_user_id,
-            },
-        )
-
-        external_conv = (message.conversation_id or external_user_id).strip()
-        external_conv_id = f"{CHANNEL_TYPE}:{external_conv}"
-        session = await find_or_create_channel_session(
-            db=db,
-            agent_id=agent_id,
-            user_id=platform_user.id,
-            external_conv_id=external_conv_id,
-            source_channel=CHANNEL_TYPE,
-            first_message_title=message.content,
-        )
-        session_id = str(session.id)
-
-        history_r = await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(ctx_size)
-        )
-        history = [{"role": item.role, "content": item.content} for item in reversed(history_r.scalars().all())]
-
-        content_for_llm = _llm_text(message)
-        db.add(
-            ChatMessage(
+            ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
+            external_user_id = message.external_user_id.strip()
+            external_name = (message.external_user_name or "").strip() or f"External User {external_user_id[:8]}"
+            platform_user = await channel_user_service.resolve_channel_user(
+                db=db,
+                agent=agent,
+                channel_type=CHANNEL_TYPE,
+                external_user_id=external_user_id,
+                extra_info={
+                    "name": external_name,
+                    "external_id": external_user_id,
+                },
+            )
+            external_conv = (message.conversation_id or external_user_id).strip()
+            external_conv_id = f"{CHANNEL_TYPE}:{external_conv}"
+            session = await find_or_create_channel_session(
+                db=db,
                 agent_id=agent_id,
                 user_id=platform_user.id,
-                role="user",
-                content=content_for_llm,
-                conversation_id=session_id,
+                external_conv_id=external_conv_id,
+                source_channel=CHANNEL_TYPE,
+                first_message_title=message.content,
             )
-        )
-        session.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
-        platform_user_id = platform_user.id
+            session_id = str(session.id)
 
-    reply_text = await _call_llm_with_config(
-        agent,
-        model,
-        fallback_model,
-        agent_id,
-        content_for_llm,
-        history=history,
-        user_id=platform_user_id,
-        session_id=session_id,
-    )
-
-    async with async_session() as db:
-        db.add(
-            ChatMessage(
-                agent_id=agent_id,
-                user_id=platform_user_id,
-                role="assistant",
-                content=reply_text,
-                conversation_id=session_id,
+            history_r = await db.execute(
+                select(ChatMessage)
+                .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_id)
+                .order_by(ChatMessage.created_at.desc())
+                .limit(ctx_size)
             )
-        )
-        session_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(session_id)))
-        session = session_r.scalar_one_or_none()
-        if session:
+            history = [{"role": item.role, "content": item.content} for item in reversed(history_r.scalars().all())]
+
+            content_for_llm = _llm_text(message)
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=platform_user.id,
+                    role="user",
+                    content=content_for_llm,
+                    conversation_id=session_id,
+                )
+            )
             session.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
+            await db.commit()
+            platform_user_id = platform_user.id
 
-    await log_activity(
-        agent_id,
-        "chat_reply",
-        f"Replied to external HTTP message: {reply_text[:80]}",
-        detail={
-            "channel": CHANNEL_TYPE,
-            "request_id": request_id,
-            "external_user_id": external_user_id,
-            "conversation_id": message.conversation_id,
-            "user_text": message.content[:500],
-            "reply": reply_text[:500],
-        },
-    )
+    async with _processing_stage(state, "agent_inference", "Agent inference failed"):
+        reply_text = await _call_llm_with_config(
+            agent,
+            model,
+            fallback_model,
+            agent_id,
+            content_for_llm,
+            history=history,
+            user_id=platform_user_id,
+            session_id=session_id,
+        )
+
+    async with _processing_stage(state, "save_response", "Failed to save agent response"):
+        async with async_session() as db:
+            db.add(
+                ChatMessage(
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    role="assistant",
+                    content=reply_text,
+                    conversation_id=session_id,
+                )
+            )
+            session_r = await db.execute(select(ChatSession).where(ChatSession.id == uuid.UUID(session_id)))
+            session = session_r.scalar_one_or_none()
+            if session:
+                session.last_message_at = datetime.now(timezone.utc)
+            await db.commit()
+
+        await log_activity(
+            agent_id,
+            "chat_reply",
+            f"Replied to external HTTP message: {reply_text[:80]}",
+            detail={
+                "channel": CHANNEL_TYPE,
+                "request_id": request_id,
+                "external_user_id": external_user_id,
+                "conversation_id": message.conversation_id,
+                "user_text": message.content[:500],
+                "reply": reply_text[:500],
+            },
+        )
 
     return {
         "ok": True,
