@@ -529,10 +529,19 @@ async def _run_async_external_http(
     _log_external_http_event("INFO", "completed", state, status_code=200, session_id=result.get("session_id"))
 
 
-def _consume_external_http_background_task(task: asyncio.Task[None]) -> None:
-    _EXTERNAL_HTTP_BACKGROUND_TASKS.discard(task)
-    if not task.cancelled():
-        task.exception()
+def _consume_external_http_background_task(
+    task: asyncio.Task[None],
+    *,
+    state: ExternalHttpRequestState,
+) -> None:
+    try:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            _log_unexpected_failure(state, exc)
+    finally:
+        _EXTERNAL_HTTP_BACKGROUND_TASKS.discard(task)
 
 
 def _start_external_http_background_task(
@@ -542,7 +551,7 @@ def _start_external_http_background_task(
 ) -> asyncio.Task[None]:
     task = asyncio.create_task(_run_async_external_http(state=state, message=message))
     _EXTERNAL_HTTP_BACKGROUND_TASKS.add(task)
-    task.add_done_callback(_consume_external_http_background_task)
+    task.add_done_callback(lambda done_task: _consume_external_http_background_task(done_task, state=state))
     return task
 
 

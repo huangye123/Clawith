@@ -394,6 +394,54 @@ async def test_background_task_is_owned_then_removed(monkeypatch):
     assert task not in external_http._EXTERNAL_HTTP_BACKGROUND_TASKS
 
 
+async def test_background_task_logs_escaped_failure_once_and_removes(monkeypatch, log_messages):
+    state = make_state(mode="async")
+    message = external_http.ExternalHttpMessageIn(content="secret content", mode="async")
+
+    async def malformed_result(**_kwargs):
+        return None
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", malformed_result)
+    task = external_http._start_external_http_background_task(state=state, message=message)
+
+    with pytest.raises(AttributeError):
+        await task
+    await asyncio.sleep(0)
+
+    output = "\n".join(log_messages)
+    assert task not in external_http._EXTERNAL_HTTP_BACKGROUND_TASKS
+    assert output.count('event="failed"') == 1
+    assert 'reason="Internal processing failed"' in output
+    assert 'error_type="AttributeError"' in output
+    assert "Traceback (most recent call last)" in output
+    assert "secret content" not in output
+
+
+async def test_cancelled_background_task_is_removed_without_duplicate_log(monkeypatch, log_messages):
+    state = make_state(mode="async")
+    message = external_http.ExternalHttpMessageIn(content="secret content", mode="async")
+    started = asyncio.Event()
+
+    async def hang(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(external_http, "_process_external_http_message", hang)
+    task = external_http._start_external_http_background_task(state=state, message=message)
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    output = "\n".join(log_messages)
+    assert task not in external_http._EXTERNAL_HTTP_BACKGROUND_TASKS
+    assert output.count('event="failed"') == 1
+    assert 'reason="request_cancelled"' in output
+    assert "secret content" not in output
+
+
 async def test_endpoint_logs_received_and_validated_without_request_secrets(monkeypatch, log_messages):
     agent_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
     body = json.dumps(
