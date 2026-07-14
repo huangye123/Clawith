@@ -302,8 +302,11 @@ async def _process_external_http_message(
     agent_id: uuid.UUID,
     message: ExternalHttpMessageIn,
     request_id: str,
-    state: ExternalHttpRequestState,
+    state: ExternalHttpRequestState | None = None,
 ) -> dict:
+    if state is None:
+        state = ExternalHttpRequestState(request_id=request_id, agent_id=agent_id, mode=message.mode)
+
     from app.api.feishu import _call_llm_with_config, _load_agent_and_model
     from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
     from app.models.chat_session import ChatSession

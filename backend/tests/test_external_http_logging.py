@@ -125,6 +125,44 @@ async def test_processing_stage_preserves_cancellation():
             raise asyncio.CancelledError
 
 
+async def test_processor_without_state_creates_fallback_for_stage_classification(monkeypatch):
+    agent_id = uuid.UUID("00000000-0000-0000-0000-000000000001")
+    message = external_http.ExternalHttpMessageIn(content="hello", mode="async")
+    state_type = external_http.ExternalHttpRequestState
+    created_states: list[external_http.ExternalHttpRequestState] = []
+
+    def capture_state(**kwargs):
+        state = state_type(**kwargs)
+        created_states.append(state)
+        return state
+
+    class FailingSession:
+        async def __aenter__(self):
+            raise RuntimeError("database unavailable")
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(external_http, "ExternalHttpRequestState", capture_state)
+    monkeypatch.setattr(external_http, "async_session", FailingSession)
+
+    with pytest.raises(external_http.ExternalHttpProcessingError) as exc_info:
+        await external_http._process_external_http_message(
+            agent_id=agent_id,
+            message=message,
+            request_id="req-fallback",
+        )
+
+    assert len(created_states) == 1
+    assert created_states[0].request_id == "req-fallback"
+    assert created_states[0].agent_id == agent_id
+    assert created_states[0].mode == "async"
+    assert created_states[0].stage == "prepare_session"
+    assert exc_info.value.stage == "prepare_session"
+    assert exc_info.value.public_reason == "Failed to prepare agent session"
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
 def test_public_error_response_contains_only_safe_reason():
     state = make_state()
     response = external_http._public_error_response(
