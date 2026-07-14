@@ -10,11 +10,11 @@ import secrets
 import time
 import traceback
 import uuid
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
@@ -41,6 +41,8 @@ DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024
 DEFAULT_SYNC_TIMEOUT_SECONDS = 120
 PROCESSING_HEARTBEAT_SECONDS = 30.0
 ASYNC_PROCESSING_TIMEOUT_SECONDS = 300.0
+
+T = TypeVar("T")
 
 _LOG_FIELD_ORDER = (
     "event",
@@ -162,6 +164,31 @@ def _log_external_http_event(
         logger.log(level.upper(), message)
     except Exception:
         pass
+
+
+async def _emit_processing_heartbeat(
+    state: ExternalHttpRequestState,
+    interval_seconds: float,
+) -> None:
+    while True:
+        await asyncio.sleep(interval_seconds)
+        _log_external_http_event("INFO", "processing", state)
+
+
+async def _run_with_heartbeat(
+    operation: Awaitable[T],
+    *,
+    state: ExternalHttpRequestState,
+    timeout_seconds: float,
+    heartbeat_interval: float = PROCESSING_HEARTBEAT_SECONDS,
+) -> T:
+    heartbeat = asyncio.create_task(_emit_processing_heartbeat(state, heartbeat_interval))
+    try:
+        return await asyncio.wait_for(operation, timeout=timeout_seconds)
+    finally:
+        heartbeat.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat
 
 
 class ExternalHttpChannelConfigIn(BaseModel):

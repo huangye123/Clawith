@@ -198,3 +198,76 @@ def test_unexpected_failure_logs_safe_event_and_internal_traceback(log_messages)
     assert 'reason="Agent inference failed"' in output
     assert 'error_type="RuntimeError"' in output
     assert "Traceback (most recent call last)" in output
+
+
+async def test_runner_emits_heartbeat_and_stops_after_completion(log_messages):
+    state = make_state()
+    state.stage = "agent_inference"
+
+    async def complete_later():
+        await asyncio.sleep(0.03)
+        return {"ok": True, "session_id": "session-1"}
+
+    result = await external_http._run_with_heartbeat(
+        complete_later(),
+        state=state,
+        timeout_seconds=1.0,
+        heartbeat_interval=0.01,
+    )
+    count_after_completion = sum('event="processing"' in message for message in log_messages)
+    await asyncio.sleep(0.02)
+
+    assert result["session_id"] == "session-1"
+    assert count_after_completion >= 1
+    assert sum('event="processing"' in message for message in log_messages) == count_after_completion
+
+
+async def test_runner_cancels_processing_on_timeout_without_retry():
+    state = make_state()
+    attempts = 0
+    cancelled = asyncio.Event()
+
+    async def never_finishes():
+        nonlocal attempts
+        attempts += 1
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    with pytest.raises(TimeoutError):
+        await external_http._run_with_heartbeat(
+            never_finishes(),
+            state=state,
+            timeout_seconds=0.01,
+            heartbeat_interval=1.0,
+        )
+
+    assert cancelled.is_set()
+    assert attempts == 1
+
+
+async def test_runner_propagates_caller_cancellation():
+    state = make_state()
+    operation_cancelled = asyncio.Event()
+
+    async def never_finishes():
+        try:
+            await asyncio.Event().wait()
+        finally:
+            operation_cancelled.set()
+
+    runner = asyncio.create_task(
+        external_http._run_with_heartbeat(
+            never_finishes(),
+            state=state,
+            timeout_seconds=1.0,
+            heartbeat_interval=1.0,
+        )
+    )
+    await asyncio.sleep(0)
+    runner.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+    assert operation_cancelled.is_set()
