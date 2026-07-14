@@ -11,7 +11,7 @@ import time
 import traceback
 import uuid
 from collections.abc import AsyncIterator, Awaitable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, TypeVar
@@ -126,7 +126,13 @@ def _log_unexpected_failure(state: ExternalHttpRequestState, exc: Exception) -> 
         error_type=type(root_exc).__name__,
         reason=reason,
     )
-    trace = "".join(traceback.format_exception(type(root_exc), root_exc, root_exc.__traceback__))
+    trace = "".join(
+        (
+            "Traceback (most recent call last):\n",
+            *traceback.format_tb(root_exc.__traceback__),
+            f"{type(root_exc).__name__}: <message redacted>\n",
+        )
+    )
     try:
         logger.error(f"[ExternalHTTP] traceback request_id={state.request_id!r}\n{trace}")
     except Exception:
@@ -186,9 +192,14 @@ async def _run_with_heartbeat(
     try:
         return await asyncio.wait_for(operation, timeout=timeout_seconds)
     finally:
+        caller = asyncio.current_task()
+        cancellation_count = caller.cancelling() if caller is not None else 0
         heartbeat.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await heartbeat
+        except asyncio.CancelledError:
+            if caller is not None and caller.cancelling() > cancellation_count:
+                raise
 
 
 class ExternalHttpChannelConfigIn(BaseModel):
