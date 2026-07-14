@@ -197,6 +197,24 @@ def test_lifecycle_logging_is_best_effort(monkeypatch):
     external_http._log_external_http_event("INFO", "received", state)
 
 
+async def test_rate_limiter_failure_log_redacts_exception_message(monkeypatch, log_messages):
+    secret = "redis://admin:private-password@redis.internal:6379/0"
+
+    async def fail_to_get_redis():
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(external_http, "get_redis", fail_to_get_redis)
+
+    count = await external_http._record_and_count_hits(make_route_config())
+
+    assert count == 1
+    message = log_messages[-1]
+    assert "Rate limiter unavailable" in message
+    assert "RuntimeError" in message
+    assert secret not in message
+    assert "private-password" not in message
+
+
 async def test_processing_stage_wraps_unexpected_error_with_public_reason():
     state = make_state()
 

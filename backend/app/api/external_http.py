@@ -337,7 +337,10 @@ async def _record_and_count_hits(config: ChannelConfig) -> int:
             _, _, count, _ = await pipe.execute()
         return int(count)
     except Exception as exc:
-        logger.warning(f"[ExternalHTTP] Rate limiter unavailable: {exc}")
+        logger.warning(
+            "[ExternalHTTP] Rate limiter unavailable: "
+            f'reason="dependency_error" exception_type="{type(exc).__name__}"'
+        )
         return 1
 
 
