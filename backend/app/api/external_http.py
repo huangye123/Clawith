@@ -9,6 +9,7 @@ import json
 import secrets
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -34,6 +35,68 @@ router = APIRouter(tags=["external-http"])
 CHANNEL_TYPE = "external_http"
 DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024
 DEFAULT_SYNC_TIMEOUT_SECONDS = 120
+PROCESSING_HEARTBEAT_SECONDS = 30.0
+ASYNC_PROCESSING_TIMEOUT_SECONDS = 300.0
+
+_LOG_FIELD_ORDER = (
+    "event",
+    "request_id",
+    "agent_id",
+    "mode",
+    "stage",
+    "status_code",
+    "duration_ms",
+    "payload_bytes",
+    "session_id",
+    "error_type",
+    "reason",
+)
+
+
+@dataclass
+class ExternalHttpRequestState:
+    request_id: str
+    agent_id: uuid.UUID
+    started_at: float = field(default_factory=time.monotonic)
+    mode: str | None = None
+    stage: str = "received"
+    payload_bytes: int | None = None
+
+    def elapsed_ms(self) -> int:
+        return max(0, round((time.monotonic() - self.started_at) * 1000))
+
+
+def _log_value(value: Any) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=True)
+
+
+def _log_external_http_event(
+    level: str,
+    event: str,
+    state: ExternalHttpRequestState,
+    **fields: Any,
+) -> None:
+    values: dict[str, Any] = {
+        "event": event,
+        "request_id": state.request_id,
+        "agent_id": state.agent_id,
+        "mode": state.mode,
+        "stage": state.stage,
+        "duration_ms": state.elapsed_ms(),
+        "payload_bytes": state.payload_bytes,
+    }
+    values.update({key: value for key, value in fields.items() if key in _LOG_FIELD_ORDER})
+    message = "[ExternalHTTP] " + " ".join(
+        f"{key}={_log_value(values[key])}"
+        for key in _LOG_FIELD_ORDER
+        if values.get(key) is not None
+    )
+    try:
+        logger.log(level.upper(), message)
+    except Exception:
+        pass
 
 
 class ExternalHttpChannelConfigIn(BaseModel):
