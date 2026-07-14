@@ -343,7 +343,7 @@ async def discord_interaction_webhook(
                 sess.last_message_at = datetime.now(timezone.utc)
 
                 # Pre-load agent/model for LLM call and extract config values
-                from app.api.feishu import _load_agent_and_model
+                from app.services.channel_llm import load_agent_and_models as _load_agent_and_model
                 _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(bg_db, agent_id)
 
                 from sqlalchemy import select as _sel
@@ -359,7 +359,7 @@ async def discord_interaction_webhook(
             # ── Phase 1 complete: release connection ──
 
             # ── Phase 2: LLM call (no DB session needed) ──
-            from app.api.feishu import _call_llm_with_config
+            from app.services.channel_llm import call_channel_llm as _call_llm_with_config
             reply_text = await _call_llm_with_config(
                 _agent_model, _llm_model, _fallback_model,
                 agent_id,

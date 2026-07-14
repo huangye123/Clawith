@@ -378,7 +378,7 @@ async def slack_event_webhook(
     sess.last_message_at = datetime.now(timezone.utc)
 
     # Pre-load agent/model for LLM call and extract config values before closing
-    from app.api.feishu import _load_agent_and_model
+    from app.services.channel_llm import load_agent_and_models as _load_agent_and_model
     _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
     _cfg_app_secret = config.app_secret or ""
 
@@ -416,7 +416,7 @@ async def slack_event_webhook(
     _cfs_s_token = _cfs_s.set(_slack_file_sender)
 
     # Call LLM (no DB session needed)
-    from app.api.feishu import _call_llm_with_config
+    from app.services.channel_llm import call_channel_llm as _call_llm_with_config
     reply_text = await _call_llm_with_config(
         _agent_model, _llm_model, _fallback_model,
         agent_id,

@@ -12,21 +12,21 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
+from app.core.permissions import check_agent_access, is_agent_creator
 from app.core.security import get_current_user
 from app.database import async_session as _async_session, get_db
 from app.models.channel_config import ChannelConfig
 from app.models.user import User
 from app.schemas.schemas import ChannelConfigCreate, ChannelConfigOut, TokenResponse, UserOut
 from app.services.feishu_service import feishu_service
-from app.services.llm.utils import convert_chat_messages_to_llm_format, truncate_messages_with_pair_integrity
+from app.services.channel_llm import (
+    call_channel_llm as _call_llm_with_config,
+    load_agent_and_models as _load_agent_and_model,
+)
+from app.services.llm.utils import convert_chat_messages_to_llm_format
 from app.services.storage import agent_upload_key, get_storage_backend, store_agent_upload
 
 router = APIRouter(tags=["feishu"])
-
-# Default LLM timeout for Feishu channel (fallback when model has no request_timeout set).
-# The per-model request_timeout field takes precedence — see _get_llm_timeout().
-_LLM_TIMEOUT_SECONDS_DEFAULT = 180.0
 
 # Number of tool status lines to keep visible in the Feishu card.
 # Shows the last N non-running lines plus any active "running" entry.
@@ -150,19 +150,6 @@ def _normalize_history_messages(history: list[dict] | None) -> list[dict]:
             continue
         normalized.append(msg)
     return normalized
-
-
-def _get_llm_timeout(model) -> float:
-    """Get effective LLM timeout for the Feishu channel.
-
-    Prefer the model-level request_timeout so each model can have its own
-    budget (local vLLM may need 300 s, cloud APIs often need only 60 s).
-    Falls back to _LLM_TIMEOUT_SECONDS_DEFAULT when the field is absent or zero.
-    """
-    timeout = getattr(model, "request_timeout", None)
-    if timeout and float(timeout) > 0:
-        return float(timeout)
-    return _LLM_TIMEOUT_SECONDS_DEFAULT
 
 
 class _SerialPatchQueue:
@@ -1593,175 +1580,6 @@ async def _download_post_images(agent_id, config, message_id, image_keys):
             logger.info(f"[Feishu] Saved post image to {workspace_path} ({len(file_bytes)} bytes)")
         except Exception as e:
                 logger.error(f"[Feishu] Failed to download post image {ik}: {e}")
-
-
-async def _load_agent_and_model(
-    db: AsyncSession, agent_id: uuid.UUID
-):
-    """Load agent and LLM model configs in a short DB transaction.
-
-    Returns (agent, model, fallback_model). Caller should extract all needed
-    scalar values before closing the session to avoid detached-instance errors.
-    """
-    from app.models.agent import Agent
-    from app.models.llm import LLMModel
-
-    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
-    agent = agent_result.scalar_one_or_none()
-    if not agent:
-        return None, None, None
-
-    model = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        model = model_result.scalar_one_or_none()
-        if model and not model.enabled:
-            logger.info(f"[Channel] Primary model {model.model} is disabled, skipping")
-            model = None
-
-    fallback_model = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
-        if fallback_model and not fallback_model.enabled:
-            logger.info(f"[Channel] Fallback model {fallback_model.model} is disabled, skipping")
-            fallback_model = None
-
-    if not model and fallback_model:
-        model = fallback_model
-        fallback_model = None
-        logger.warning(f"[Channel] Primary model unavailable, using fallback: {model.model}")
-
-    return agent, model, fallback_model
-
-
-async def _call_llm_with_config(
-    agent,
-    model,
-    fallback_model,
-    agent_id: uuid.UUID,
-    user_text: str,
-    history: list[dict] | None = None,
-    user_id=None,
-    session_id: str = "",
-    on_chunk=None,
-    on_thinking=None,
-    on_tool_call=None,
-) -> str:
-    """Call LLM with pre-loaded agent/model objects. No DB session needed.
-
-    This is the hot path — all DB queries should be done before calling this.
-    """
-    from app.services.llm import call_llm
-
-    if is_agent_expired(agent):
-        return "This Agent has expired and is off duty. Please contact your admin to extend its service."
-
-    if not model:
-        return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
-
-    # Build conversation messages (without system prompt — call_llm adds it)
-    messages: list[dict] = []
-    from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-    ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
-    if history:
-        messages.extend(truncate_messages_with_pair_integrity(history, ctx_size))
-    messages.append({"role": "user", "content": user_text})
-
-    effective_user_id = user_id or agent_id
-    _timeout = _get_llm_timeout(model)
-
-    try:
-        reply = await asyncio.wait_for(
-            call_llm(
-                model,
-                messages,
-                agent.name,
-                agent.role_description or "",
-                agent_id=agent_id,
-                user_id=effective_user_id,
-                session_id=session_id,
-                supports_vision=getattr(model, 'supports_vision', False),
-                on_chunk=on_chunk,
-                on_thinking=on_thinking,
-                on_tool_call=on_tool_call,
-            ),
-            timeout=_timeout,
-        )
-        return reply
-    except asyncio.TimeoutError:
-        logger.error(
-            f"[LLM] Call timed out after {_timeout}s "
-            f"(agent_id={agent_id}, model={getattr(model, 'model', 'unknown')})"
-        )
-        if fallback_model:
-            _fb_timeout = _get_llm_timeout(fallback_model)
-            logger.info(f"[LLM] Retrying timed-out request with fallback model: {fallback_model.model} (timeout={_fb_timeout}s)")
-            try:
-                reply = await asyncio.wait_for(
-                    call_llm(
-                        fallback_model,
-                        messages,
-                        agent.name,
-                        agent.role_description or "",
-                        agent_id=agent_id,
-                        user_id=effective_user_id,
-                        session_id=session_id,
-                        supports_vision=getattr(fallback_model, 'supports_vision', False),
-                        on_chunk=on_chunk,
-                        on_thinking=on_thinking,
-                        on_tool_call=on_tool_call,
-                    ),
-                    timeout=_fb_timeout,
-                )
-                return reply
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[LLM] Fallback call also timed out after {_fb_timeout}s "
-                    f"(agent_id={agent_id}, model={getattr(fallback_model, 'model', 'unknown')})"
-                )
-                return f"⚠️ Model response timed out (>{int(_fb_timeout)}s). Please retry or shorten your request."
-            except Exception as e2:
-                import traceback
-                traceback.print_exc()
-                return f"⚠️ Model error: Primary Timeout | Fallback: {str(e2)[:80]}"
-        return f"⚠️ Model response timed out (>{int(_timeout)}s). Please retry or shorten your request."
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        error_msg = str(e) or repr(e)
-        logger.error(f"[LLM] Primary model error: {error_msg}")
-        if fallback_model:
-            logger.info(f"[LLM] Retrying with fallback model: {fallback_model.model}")
-            try:
-                _fb_timeout = _get_llm_timeout(fallback_model)
-                reply = await asyncio.wait_for(
-                    call_llm(
-                        fallback_model,
-                        messages,
-                        agent.name,
-                        agent.role_description or "",
-                        agent_id=agent_id,
-                        user_id=effective_user_id,
-                        session_id=session_id,
-                        supports_vision=getattr(fallback_model, 'supports_vision', False),
-                        on_chunk=on_chunk,
-                        on_thinking=on_thinking,
-                        on_tool_call=on_tool_call,
-                    ),
-                    timeout=_fb_timeout,
-                )
-                return reply
-            except asyncio.TimeoutError:
-                logger.error(
-                    f"[LLM] Fallback call timed out after {_fb_timeout}s "
-                    f"(agent_id={agent_id}, model={getattr(fallback_model, 'model', 'unknown')})"
-                )
-                return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback Timeout"
-            except Exception as e2:
-                traceback.print_exc()
-                return f"⚠️ Model error: Primary: {str(e)[:80]} | Fallback: {str(e2)[:80]}"
-        return f"⚠️ 调用模型出错: {error_msg[:150]}"
 
 
 async def _call_agent_llm(

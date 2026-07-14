@@ -6,10 +6,12 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 import traceback
 import uuid
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -19,7 +21,7 @@ from typing import Any, TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,8 +43,22 @@ DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024
 DEFAULT_SYNC_TIMEOUT_SECONDS = 120
 PROCESSING_HEARTBEAT_SECONDS = 30.0
 ASYNC_PROCESSING_TIMEOUT_SECONDS = 300.0
+HMAC_TIMESTAMP_WINDOW_SECONDS = 300
+MAX_EXTERNAL_USER_ID_LENGTH = 100
+MAX_EXTERNAL_USER_NAME_LENGTH = 100
+MAX_CONVERSATION_ID_LENGTH = 255
+MAX_METADATA_JSON_BYTES = 64 * 1024
+MAX_METADATA_DEPTH = 10
+MAX_METADATA_NODES = 1024
+GLOBAL_PROCESSING_CONCURRENCY = 128
+PER_AGENT_PROCESSING_CONCURRENCY = 4
 
 T = TypeVar("T")
+
+_GLOBAL_PROCESSING_SEMAPHORE = asyncio.Semaphore(GLOBAL_PROCESSING_CONCURRENCY)
+_AGENT_PROCESSING_SEMAPHORES: dict[uuid.UUID, asyncio.Semaphore] = {}
+_LOCAL_RATE_HITS: dict[str, deque[float]] = {}
+_LOCAL_RATE_LOCK = asyncio.Lock()
 
 _LOG_FIELD_ORDER = (
     "event",
@@ -67,16 +83,26 @@ class ExternalHttpRequestState:
     mode: str | None = None
     stage: str = "received"
     payload_bytes: int | None = None
+    session_id: str | None = None
 
     def elapsed_ms(self) -> int:
         return max(0, round((time.monotonic() - self.started_at) * 1000))
 
 
 class ExternalHttpProcessingError(Exception):
-    def __init__(self, stage: str, public_reason: str) -> None:
+    def __init__(
+        self,
+        stage: str,
+        public_reason: str,
+        *,
+        status_code: int = status.HTTP_500_INTERNAL_SERVER_ERROR,
+        error_code: str = "processing_failed",
+    ) -> None:
         super().__init__(public_reason)
         self.stage = stage
         self.public_reason = public_reason
+        self.status_code = status_code
+        self.error_code = error_code
 
 
 @asynccontextmanager
@@ -99,14 +125,56 @@ def _public_error_response(
     reason: str,
     *,
     status_code: int,
+    error_code: str = "internal_processing_failed",
+    headers: dict[str, str] | None = None,
 ) -> JSONResponse:
+    response_headers = dict(headers or {})
+    response_headers.setdefault("X-Request-ID", state.request_id)
     return JSONResponse(
         status_code=status_code,
+        headers=response_headers,
         content={
             "ok": False,
             "request_id": state.request_id,
+            "error_code": error_code,
             "error": reason,
         },
+    )
+
+
+_HTTP_ERROR_CODES = {
+    "External HTTP channel not configured": "channel_not_configured",
+    "Missing external HTTP channel API key": "missing_api_key",
+    "Invalid external HTTP channel API key": "invalid_api_key",
+    "External HTTP channel signing secret is not configured": "signing_secret_not_configured",
+    "Missing HMAC signature headers": "missing_hmac_headers",
+    "Invalid HMAC timestamp": "invalid_hmac_timestamp",
+    "Expired HMAC timestamp": "expired_hmac_timestamp",
+    "Invalid HMAC signature": "invalid_hmac_signature",
+    "Replayed HMAC request": "replayed_hmac_request",
+    "HMAC replay protection unavailable": "replay_protection_unavailable",
+    "Payload too large": "payload_too_large",
+    "Invalid Content-Length": "invalid_content_length",
+    "Invalid request body": "invalid_request_body",
+    "Rate limit exceeded": "rate_limit_exceeded",
+    "Processing capacity exhausted": "processing_capacity_exhausted",
+    "Agent not found": "agent_not_found",
+}
+
+
+def _http_exception_response(state: ExternalHttpRequestState, exc: HTTPException) -> JSONResponse:
+    reason = exc.detail if isinstance(exc.detail, str) else "Request rejected"
+    headers = dict(exc.headers or {})
+    if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        headers.setdefault("Retry-After", "60")
+    elif exc.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+        headers.setdefault("Retry-After", "1")
+    return _public_error_response(
+        state,
+        reason,
+        status_code=exc.status_code,
+        error_code=_HTTP_ERROR_CODES.get(reason, "request_rejected"),
+        headers=headers or None,
     )
 
 
@@ -159,12 +227,11 @@ def _log_external_http_event(
         "stage": state.stage,
         "duration_ms": state.elapsed_ms(),
         "payload_bytes": state.payload_bytes,
+        "session_id": state.session_id,
     }
     values.update({key: value for key, value in fields.items() if key in _LOG_FIELD_ORDER})
     message = "[ExternalHTTP] " + " ".join(
-        f"{key}={_log_value(values[key])}"
-        for key in _LOG_FIELD_ORDER
-        if values.get(key) is not None
+        f"{key}={_log_value(values[key])}" for key in _LOG_FIELD_ORDER if values.get(key) is not None
     )
     try:
         logger.log(level.upper(), message)
@@ -212,11 +279,60 @@ class ExternalHttpChannelConfigIn(BaseModel):
 
 class ExternalHttpMessageIn(BaseModel):
     content: str = Field(min_length=1, max_length=60000)
-    external_user_id: str = Field(default="external", min_length=1, max_length=255)
-    external_user_name: str | None = Field(default=None, max_length=255)
-    conversation_id: str | None = Field(default=None, max_length=255)
+    external_user_id: str = Field(default="external", min_length=1, max_length=MAX_EXTERNAL_USER_ID_LENGTH)
+    external_user_name: str | None = Field(default=None, max_length=MAX_EXTERNAL_USER_NAME_LENGTH)
+    conversation_id: str | None = Field(default=None, max_length=MAX_CONVERSATION_ID_LENGTH)
     metadata: dict[str, Any] | None = None
     mode: str = Field(default="sync", pattern="^(sync|async)$")
+
+    @field_validator("content")
+    @classmethod
+    def _content_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("content must not be blank")
+        return value
+
+    @field_validator("external_user_id")
+    @classmethod
+    def _normalize_external_user_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("external_user_id must not be blank")
+        return normalized
+
+    @field_validator("external_user_name", "conversation_id")
+    @classmethod
+    def _normalize_optional_identifier(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("value must not be blank")
+        return normalized
+
+    @field_validator("metadata")
+    @classmethod
+    def _bound_metadata(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        if len(encoded) > MAX_METADATA_JSON_BYTES:
+            raise ValueError("metadata is too large")
+
+        nodes = 0
+        stack: list[tuple[Any, int]] = [(value, 1)]
+        while stack:
+            current, depth = stack.pop()
+            nodes += 1
+            if nodes > MAX_METADATA_NODES:
+                raise ValueError("metadata contains too many values")
+            if depth > MAX_METADATA_DEPTH:
+                raise ValueError("metadata is nested too deeply")
+            if isinstance(current, dict):
+                stack.extend((item, depth + 1) for item in current.values())
+            elif isinstance(current, list):
+                stack.extend((item, depth + 1) for item in current)
+        return value
 
 
 _EXTERNAL_HTTP_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
@@ -307,26 +423,60 @@ def _verify_hmac_signature(config: ChannelConfig, request: Request, body: bytes)
     if not timestamp or not signature:
         raise HTTPException(status_code=401, detail="Missing HMAC signature headers")
 
-    try:
-        ts_value = int(timestamp)
-    except ValueError:
+    if len(timestamp) > 12 or not timestamp.isascii() or not timestamp.isdigit():
         raise HTTPException(status_code=401, detail="Invalid HMAC timestamp") from None
+    ts_value = int(timestamp)
 
-    if abs(int(time.time()) - ts_value) > 300:
+    if abs(int(time.time()) - ts_value) > HMAC_TIMESTAMP_WINDOW_SECONDS:
         raise HTTPException(status_code=401, detail="Expired HMAC timestamp")
 
     signed_payload = timestamp.encode("utf-8") + b"." + body
     expected = hmac.new(signing_secret.encode("utf-8"), signed_payload, hashlib.sha256).hexdigest()
-    provided = signature.removeprefix("sha256=").strip()
+    provided = signature.removeprefix("sha256=").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", provided) is None:
+        raise HTTPException(status_code=401, detail="Invalid HMAC signature")
     if not hmac.compare_digest(expected, provided):
         raise HTTPException(status_code=401, detail="Invalid HMAC signature")
 
 
-async def _record_and_count_hits(config: ChannelConfig) -> int:
+async def _claim_hmac_signature(config: ChannelConfig, request: Request) -> None:
+    if not (config.extra_config or {}).get("require_hmac"):
+        return
+    signature = request.headers.get("x-signature-sha256", "").removeprefix("sha256=").strip().lower()
+    token_key = (config.extra_config or {}).get("api_key_hash") or str(config.agent_id)
+    replay_key = f"external_http:replay:{token_key[:16]}:{signature}"
     try:
         redis = await get_redis()
-        now = time.time()
-        token_key = (config.extra_config or {}).get("api_key_hash") or str(config.agent_id)
+        claimed = await redis.set(replay_key, "1", ex=HMAC_TIMESTAMP_WINDOW_SECONDS, nx=True)
+    except Exception as exc:
+        logger.warning(
+            "[ExternalHTTP] HMAC replay protection unavailable: "
+            f'reason="dependency_error" exception_type="{type(exc).__name__}"'
+        )
+        raise HTTPException(status_code=503, detail="HMAC replay protection unavailable") from None
+    if not claimed:
+        raise HTTPException(status_code=409, detail="Replayed HMAC request")
+
+
+def _rate_limit_key(config: ChannelConfig) -> str:
+    return (config.extra_config or {}).get("api_key_hash") or str(config.agent_id)
+
+
+async def _record_local_rate_hit(token_key: str, now: float) -> int:
+    async with _LOCAL_RATE_LOCK:
+        hits = _LOCAL_RATE_HITS.setdefault(token_key, deque())
+        cutoff = now - 60
+        while hits and hits[0] <= cutoff:
+            hits.popleft()
+        hits.append(now)
+        return len(hits)
+
+
+async def _record_and_count_hits(config: ChannelConfig) -> int:
+    now = time.time()
+    token_key = _rate_limit_key(config)
+    try:
+        redis = await get_redis()
         key = f"external_http:rate:{token_key}"
         member = f"{now}:{secrets.token_hex(4)}"
         async with redis.pipeline(transaction=True) as pipe:
@@ -338,10 +488,73 @@ async def _record_and_count_hits(config: ChannelConfig) -> int:
         return int(count)
     except Exception as exc:
         logger.warning(
-            "[ExternalHTTP] Rate limiter unavailable: "
-            f'reason="dependency_error" exception_type="{type(exc).__name__}"'
+            f'[ExternalHTTP] Rate limiter unavailable: reason="local_fallback" exception_type="{type(exc).__name__}"'
         )
-        return 1
+        return await _record_local_rate_hit(token_key, now)
+
+
+def _bounded_config_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
+
+
+async def _read_limited_body(request: Request, max_payload_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from None
+        if declared_size < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length")
+        if declared_size > max_payload_bytes:
+            raise HTTPException(status_code=413, detail="Payload too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > max_payload_bytes:
+            raise HTTPException(status_code=413, detail="Payload too large")
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _external_conversation_key(external_user_id: str, conversation_id: str | None) -> str:
+    user_digest = hashlib.sha256(external_user_id.encode("utf-8")).hexdigest()
+    conversation = conversation_id or external_user_id
+    conversation_digest = hashlib.sha256(conversation.encode("utf-8")).hexdigest()
+    return f"{CHANNEL_TYPE}:{user_digest}:{conversation_digest}"
+
+
+@dataclass
+class _ProcessingLease:
+    global_semaphore: asyncio.Semaphore
+    agent_semaphore: asyncio.Semaphore
+    released: bool = False
+
+    def release(self) -> None:
+        if self.released:
+            return
+        self.released = True
+        self.agent_semaphore.release()
+        self.global_semaphore.release()
+
+
+async def _try_acquire_processing_lease(agent_id: uuid.UUID) -> _ProcessingLease | None:
+    agent_semaphore = _AGENT_PROCESSING_SEMAPHORES.setdefault(
+        agent_id,
+        asyncio.Semaphore(PER_AGENT_PROCESSING_CONCURRENCY),
+    )
+    if _GLOBAL_PROCESSING_SEMAPHORE.locked() or agent_semaphore.locked():
+        return None
+    await _GLOBAL_PROCESSING_SEMAPHORE.acquire()
+    if agent_semaphore.locked():
+        _GLOBAL_PROCESSING_SEMAPHORE.release()
+        return None
+    await agent_semaphore.acquire()
+    return _ProcessingLease(_GLOBAL_PROCESSING_SEMAPHORE, agent_semaphore)
 
 
 def _llm_text(message: ExternalHttpMessageIn) -> str:
@@ -349,6 +562,30 @@ def _llm_text(message: ExternalHttpMessageIn) -> str:
         return message.content
     metadata_text = json.dumps(message.metadata, ensure_ascii=False, indent=2, default=str)
     return f"{message.content}\n\n[External HTTP metadata]\n{metadata_text}"
+
+
+def _raise_for_llm_error_reply(reply: str) -> None:
+    """Turn call_llm's legacy error strings into a channel-level failure."""
+    if reply.startswith(("[LLM Error]", "[LLM call error]", "[Error]")):
+        raise ExternalHttpProcessingError(
+            "agent_inference",
+            "Upstream model request failed",
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            error_code="upstream_llm_error",
+        )
+
+
+def _tool_result_is_error(result: object) -> bool:
+    normalized = str(result or "").strip().lower()
+    return normalized.startswith((
+        "error:",
+        "[error]",
+        "[llm error]",
+        "[llm call error]",
+        "failed:",
+        "timeout:",
+        "⚠️",
+    ))
 
 
 async def _process_external_http_message(
@@ -360,21 +597,26 @@ async def _process_external_http_message(
 ) -> dict:
     if state is None:
         state = ExternalHttpRequestState(request_id=request_id, agent_id=agent_id, mode=message.mode)
+    # Lifecycle logs intentionally expose the caller's conversation identifier,
+    # not Clawith's internal ChatSession UUID.
+    state.session_id = message.conversation_id
 
-    from app.api.feishu import _call_llm_with_config, _load_agent_and_model
     from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
     from app.models.chat_session import ChatSession
     from app.services.activity_logger import log_activity
+    from app.services.channel_llm import call_channel_llm, load_agent_and_models
+    from app.services.chat_session_service import save_tool_call_log
+    from app.services.llm.utils import convert_chat_messages_to_llm_format
 
     async with _processing_stage(state, "prepare_session", "Failed to prepare agent session"):
         async with async_session() as db:
-            agent, model, fallback_model = await _load_agent_and_model(db, agent_id)
+            agent, model, fallback_model = await load_agent_and_models(db, agent_id)
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
 
             ctx_size = agent.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
-            external_user_id = message.external_user_id.strip()
-            external_name = (message.external_user_name or "").strip() or f"External User {external_user_id[:8]}"
+            external_user_id = message.external_user_id
+            external_name = message.external_user_name or f"External User {external_user_id[:8]}"
             platform_user = await channel_user_service.resolve_channel_user(
                 db=db,
                 agent=agent,
@@ -385,8 +627,7 @@ async def _process_external_http_message(
                     "external_id": external_user_id,
                 },
             )
-            external_conv = (message.conversation_id or external_user_id).strip()
-            external_conv_id = f"{CHANNEL_TYPE}:{external_conv}"
+            external_conv_id = _external_conversation_key(external_user_id, message.conversation_id)
             session = await find_or_create_channel_session(
                 db=db,
                 agent_id=agent_id,
@@ -403,7 +644,7 @@ async def _process_external_http_message(
                 .order_by(ChatMessage.created_at.desc())
                 .limit(ctx_size)
             )
-            history = [{"role": item.role, "content": item.content} for item in reversed(history_r.scalars().all())]
+            history = convert_chat_messages_to_llm_format(reversed(history_r.scalars().all()))
 
             content_for_llm = _llm_text(message)
             db.add(
@@ -419,8 +660,39 @@ async def _process_external_http_message(
             await db.commit()
             platform_user_id = platform_user.id
 
+    tool_call_summaries: dict[str, dict[str, Any]] = {}
+    persisted_tool_calls: set[str] = set()
+
+    async def _on_tool_call(event: dict) -> None:
+        tool_name = str(event.get("name") or "unknown_tool")
+        call_id = str(event.get("call_id") or "")
+        summary_key = call_id or tool_name
+        tool_status = str(event.get("status") or "unknown").lower()
+        summary: dict[str, Any] = {
+            "name": tool_name,
+            "call_id": call_id or None,
+            "status": tool_status,
+        }
+        if tool_status == "done":
+            result = event.get("result")
+            summary["outcome"] = "error" if _tool_result_is_error(result) else "success"
+            if summary_key not in persisted_tool_calls:
+                persisted_tool_calls.add(summary_key)
+                await save_tool_call_log(
+                    agent_id=agent_id,
+                    user_id=platform_user_id,
+                    conversation_id=session_id,
+                    tool_name=tool_name,
+                    arguments=event.get("args") or event.get("arguments") or {},
+                    result=str(result or "")[:500],
+                    status=tool_status,
+                    tool_call_id=call_id or None,
+                    reasoning_content=event.get("reasoning_content"),
+                )
+        tool_call_summaries[summary_key] = summary
+
     async with _processing_stage(state, "agent_inference", "Agent inference failed"):
-        reply_text = await _call_llm_with_config(
+        reply_text = await call_channel_llm(
             agent,
             model,
             fallback_model,
@@ -429,7 +701,9 @@ async def _process_external_http_message(
             history=history,
             user_id=platform_user_id,
             session_id=session_id,
+            on_tool_call=_on_tool_call,
         )
+        _raise_for_llm_error_reply(reply_text)
 
     async with _processing_stage(state, "save_response", "Failed to save agent response"):
         async with async_session() as db:
@@ -467,6 +741,12 @@ async def _process_external_http_message(
         "request_id": request_id,
         "session_id": session_id,
         "reply": reply_text,
+        "tool_calls": list(tool_call_summaries.values()),
+        "tool_errors": [
+            summary["name"]
+            for summary in tool_call_summaries.values()
+            if summary.get("outcome") == "error"
+        ],
     }
 
 
@@ -476,34 +756,57 @@ async def _run_sync_external_http(
     message: ExternalHttpMessageIn,
     timeout_seconds: float,
     heartbeat_interval: float = PROCESSING_HEARTBEAT_SECONDS,
+    processing_lease: _ProcessingLease | None = None,
 ) -> dict | JSONResponse:
     try:
-        result = await _run_with_heartbeat(
-            _process_external_http_message(
-                agent_id=state.agent_id,
-                message=message,
-                request_id=state.request_id,
+        try:
+            result = await _run_with_heartbeat(
+                _process_external_http_message(
+                    agent_id=state.agent_id,
+                    message=message,
+                    request_id=state.request_id,
+                    state=state,
+                ),
                 state=state,
-            ),
-            state=state,
-            timeout_seconds=timeout_seconds,
-            heartbeat_interval=heartbeat_interval,
-        )
+                timeout_seconds=timeout_seconds,
+                heartbeat_interval=heartbeat_interval,
+            )
+        finally:
+            if processing_lease is not None:
+                processing_lease.release()
     except TimeoutError:
         _log_external_http_event("ERROR", "timeout", state, status_code=504, reason="Agent processing timed out")
-        return _public_error_response(state, "Agent processing timed out", status_code=504)
+        return _public_error_response(
+            state,
+            "Agent processing timed out",
+            status_code=504,
+            error_code="processing_timeout",
+        )
     except HTTPException as exc:
         _log_rejected(state, exc)
-        raise
+        return _http_exception_response(state, exc)
     except asyncio.CancelledError:
         _log_external_http_event("WARNING", "failed", state, reason="request_cancelled")
         raise
+    except ExternalHttpProcessingError as exc:
+        _log_unexpected_failure(state, exc)
+        return _public_error_response(
+            state,
+            exc.public_reason,
+            status_code=exc.status_code,
+            error_code=exc.error_code,
+        )
     except Exception as exc:
         _log_unexpected_failure(state, exc)
-        return _public_error_response(state, _public_reason(exc), status_code=500)
+        return _public_error_response(
+            state,
+            _public_reason(exc),
+            status_code=500,
+            error_code="processing_failed",
+        )
 
     state.stage = "completed"
-    _log_external_http_event("INFO", "completed", state, status_code=200, session_id=result.get("session_id"))
+    _log_external_http_event("INFO", "completed", state, status_code=200)
     return result
 
 
@@ -513,19 +816,24 @@ async def _run_async_external_http(
     message: ExternalHttpMessageIn,
     timeout_seconds: float = ASYNC_PROCESSING_TIMEOUT_SECONDS,
     heartbeat_interval: float = PROCESSING_HEARTBEAT_SECONDS,
+    processing_lease: _ProcessingLease | None = None,
 ) -> None:
     try:
-        result = await _run_with_heartbeat(
-            _process_external_http_message(
-                agent_id=state.agent_id,
-                message=message,
-                request_id=state.request_id,
+        try:
+            result = await _run_with_heartbeat(
+                _process_external_http_message(
+                    agent_id=state.agent_id,
+                    message=message,
+                    request_id=state.request_id,
+                    state=state,
+                ),
                 state=state,
-            ),
-            state=state,
-            timeout_seconds=timeout_seconds,
-            heartbeat_interval=heartbeat_interval,
-        )
+                timeout_seconds=timeout_seconds,
+                heartbeat_interval=heartbeat_interval,
+            )
+        finally:
+            if processing_lease is not None:
+                processing_lease.release()
     except TimeoutError:
         _log_external_http_event("ERROR", "timeout", state, reason="Agent processing timed out")
         return
@@ -535,12 +843,17 @@ async def _run_async_external_http(
     except asyncio.CancelledError:
         _log_external_http_event("WARNING", "failed", state, reason="request_cancelled")
         raise
+    except ExternalHttpProcessingError as exc:
+        _log_unexpected_failure(state, exc)
+        return
     except Exception as exc:
         _log_unexpected_failure(state, exc)
         return
 
+    # Validate the processor contract without logging its internal ChatSession UUID.
+    result.get("session_id")
     state.stage = "completed"
-    _log_external_http_event("INFO", "completed", state, status_code=200, session_id=result.get("session_id"))
+    _log_external_http_event("INFO", "completed", state, status_code=200)
 
 
 def _consume_external_http_background_task(
@@ -562,8 +875,15 @@ def _start_external_http_background_task(
     *,
     state: ExternalHttpRequestState,
     message: ExternalHttpMessageIn,
+    processing_lease: _ProcessingLease | None = None,
 ) -> asyncio.Task[None]:
-    task = asyncio.create_task(_run_async_external_http(state=state, message=message))
+    task = asyncio.create_task(
+        _run_async_external_http(
+            state=state,
+            message=message,
+            processing_lease=processing_lease,
+        )
+    )
     _EXTERNAL_HTTP_BACKGROUND_TASKS.add(task)
     task.add_done_callback(lambda done_task: _consume_external_http_background_task(done_task, state=state))
     return task
@@ -717,57 +1037,97 @@ async def external_http_message(
 
             _verify_api_key(config, request)
 
-            max_payload = int((config.extra_config or {}).get("max_payload_bytes") or DEFAULT_MAX_PAYLOAD_BYTES)
-            body = await request.body()
-            if len(body) > max_payload:
-                raise HTTPException(status_code=413, detail="Payload too large")
+            max_payload = _bounded_config_int(
+                (config.extra_config or {}).get("max_payload_bytes"),
+                default=DEFAULT_MAX_PAYLOAD_BYTES,
+                minimum=1024,
+                maximum=1024 * 1024,
+            )
+            body = await _read_limited_body(request, max_payload)
+            state.payload_bytes = len(body)
 
             _verify_hmac_signature(config, request, body)
+            await _claim_hmac_signature(config, request)
 
             hit_count = await _record_and_count_hits(config)
             from app.models.agent import Agent
 
             agent_r = await db.execute(select(Agent).where(Agent.id == agent_id))
             agent = agent_r.scalar_one_or_none()
-            rate_limit = (agent.webhook_rate_limit if agent else None) or 5
+            rate_limit = _bounded_config_int(
+                agent.webhook_rate_limit if agent else None,
+                default=5,
+                minimum=1,
+                maximum=100000,
+            )
             if hit_count > rate_limit:
                 raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
-            timeout_seconds = max(
-                5,
-                min(
-                    300,
-                    int((config.extra_config or {}).get("sync_timeout_seconds") or DEFAULT_SYNC_TIMEOUT_SECONDS),
-                ),
+            timeout_seconds = _bounded_config_int(
+                (config.extra_config or {}).get("sync_timeout_seconds"),
+                default=DEFAULT_SYNC_TIMEOUT_SECONDS,
+                minimum=5,
+                maximum=300,
             )
 
         try:
             payload = ExternalHttpMessageIn.model_validate_json(body)
-        except Exception as exc:
-            raise HTTPException(status_code=422, detail=f"Invalid request body: {exc}") from None
+        except Exception:
+            raise HTTPException(status_code=422, detail="Invalid request body") from None
     except HTTPException as exc:
         _log_rejected(state, exc)
-        raise
+        return _http_exception_response(state, exc)
     except asyncio.CancelledError:
         _log_external_http_event("WARNING", "failed", state, reason="request_cancelled")
         raise
     except Exception as exc:
         _log_unexpected_failure(state, exc)
-        return _public_error_response(state, "Internal processing failed", status_code=500)
+        return _public_error_response(
+            state,
+            "Internal processing failed",
+            status_code=500,
+            error_code="internal_processing_failed",
+        )
 
     state.mode = payload.mode
-    state.payload_bytes = len(body)
+    state.session_id = payload.conversation_id
     state.stage = "validated"
     _log_external_http_event("INFO", "validated", state)
 
+    processing_lease = await _try_acquire_processing_lease(agent_id)
+    if processing_lease is None:
+        exc = HTTPException(status_code=503, detail="Processing capacity exhausted")
+        _log_rejected(state, exc)
+        return _http_exception_response(state, exc)
+
     if payload.mode == "async":
         state.stage = "accepted"
-        _start_external_http_background_task(state=state, message=payload)
-        _log_external_http_event("INFO", "accepted", state, status_code=200)
-        return {"ok": True, "status": "accepted", "request_id": state.request_id}
+        try:
+            _start_external_http_background_task(
+                state=state,
+                message=payload,
+                processing_lease=processing_lease,
+            )
+        except Exception:
+            processing_lease.release()
+            raise
+        _log_external_http_event("INFO", "accepted", state, status_code=202)
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            headers={"X-Request-ID": state.request_id},
+            content={"ok": True, "status": "accepted", "request_id": state.request_id},
+        )
 
-    return await _run_sync_external_http(
+    result = await _run_sync_external_http(
         state=state,
         message=payload,
         timeout_seconds=timeout_seconds,
+        processing_lease=processing_lease,
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        headers={"X-Request-ID": state.request_id},
+        content=result,
     )

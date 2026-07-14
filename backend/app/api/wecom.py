@@ -591,7 +591,7 @@ async def _process_wecom_text(
         sess.last_message_at = datetime.now(timezone.utc)
 
         # Pre-load agent/model for LLM call
-        from app.api.feishu import _load_agent_and_model
+        from app.services.channel_llm import load_agent_and_models as _load_agent_and_model
         _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
 
         await db.commit()
@@ -599,7 +599,7 @@ async def _process_wecom_text(
         await db.close()
 
         # Call LLM (no DB session needed)
-        from app.api.feishu import _call_llm_with_config
+        from app.services.channel_llm import call_channel_llm as _call_llm_with_config
         reply_text = await _call_llm_with_config(
             _agent_model, _llm_model, _fallback_model,
             agent_id, user_text,

@@ -256,7 +256,7 @@ async def process_dingtalk_message(
         _dt_app_secret = _dt_cfg.app_secret if _dt_cfg else None
 
         # Pre-load agent/model for LLM call
-        from app.api.feishu import _load_agent_and_model
+        from app.services.channel_llm import load_agent_and_models as _load_agent_and_model
         _agent_model, _llm_model, _fallback_model = await _load_agent_and_model(db, agent_id)
 
         # Extract agent name before closing session
@@ -346,7 +346,7 @@ async def process_dingtalk_message(
             _cfs_token = _cfs.set(_dingtalk_file_sender)
 
         # Call LLM (no DB session needed)
-        from app.api.feishu import _call_llm_with_config
+        from app.services.channel_llm import call_channel_llm as _call_llm_with_config
         try:
             reply_text = await _call_llm_with_config(
                 _agent_model, _llm_model, _fallback_model,

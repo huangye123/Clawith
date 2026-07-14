@@ -8,8 +8,8 @@ import pytest
 from fastapi import FastAPI, HTTPException
 from loguru import logger
 
-from app.api import external_http, feishu
-from app.services import activity_logger
+from app.api import external_http
+from app.services import activity_logger, channel_llm, chat_session_service
 
 
 ROUTE_AGENT_ID = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -81,7 +81,7 @@ def make_route_config(
     )
 
 
-def install_route_processing_boundaries(monkeypatch, config, llm_call):
+def install_route_processing_boundaries(monkeypatch, config, llm_call, *, history=None):
     validation_agent = SimpleNamespace(webhook_rate_limit=5)
     processing_agent = SimpleNamespace(context_window_size=None)
     platform_user = SimpleNamespace(id=uuid.UUID("00000000-0000-0000-0000-000000000002"))
@@ -89,7 +89,7 @@ def install_route_processing_boundaries(monkeypatch, config, llm_call):
         id=uuid.UUID("00000000-0000-0000-0000-000000000003"),
         last_message_at=None,
     )
-    session = FakeSession((config, validation_agent, [], channel_session))
+    session = FakeSession((config, validation_agent, history or [], channel_session))
 
     async def count_hits(_config):
         return 1
@@ -108,8 +108,8 @@ def install_route_processing_boundaries(monkeypatch, config, llm_call):
 
     monkeypatch.setattr(external_http, "async_session", FakeSessionFactory(session))
     monkeypatch.setattr(external_http, "_record_and_count_hits", count_hits)
-    monkeypatch.setattr(feishu, "_load_agent_and_model", load_agent_and_model)
-    monkeypatch.setattr(feishu, "_call_llm_with_config", llm_call)
+    monkeypatch.setattr(channel_llm, "load_agent_and_models", load_agent_and_model)
+    monkeypatch.setattr(channel_llm, "call_channel_llm", llm_call)
     monkeypatch.setattr(external_http.channel_user_service, "resolve_channel_user", resolve_channel_user)
     monkeypatch.setattr(external_http, "find_or_create_channel_session", find_channel_session)
     monkeypatch.setattr(activity_logger, "log_activity", record_activity)
@@ -187,6 +187,18 @@ def test_lifecycle_log_is_searchable_and_filters_sensitive_fields(monkeypatch, l
         assert secret not in message
 
 
+def test_lifecycle_log_includes_session_id_from_request_state(monkeypatch, log_messages):
+    monkeypatch.setattr(external_http.time, "monotonic", lambda: 10.125)
+    state = make_state()
+    state.session_id = "business-conversation-42"
+
+    external_http._log_external_http_event("INFO", "processing", state)
+
+    message = log_messages[-1]
+    assert 'event="processing"' in message
+    assert 'session_id="business-conversation-42"' in message
+
+
 def test_lifecycle_logging_is_best_effort(monkeypatch):
     state = make_state()
 
@@ -204,6 +216,7 @@ async def test_rate_limiter_failure_log_redacts_exception_message(monkeypatch, l
         raise RuntimeError(secret)
 
     monkeypatch.setattr(external_http, "get_redis", fail_to_get_redis)
+    external_http._LOCAL_RATE_HITS.clear()
 
     count = await external_http._record_and_count_hits(make_route_config())
 
@@ -309,6 +322,7 @@ def test_public_error_response_contains_only_safe_reason():
     assert json.loads(response.body) == {
         "ok": False,
         "request_id": "req-123",
+        "error_code": "internal_processing_failed",
         "error": "Agent inference failed",
     }
     assert b"provider-secret-detail" not in response.body
@@ -475,6 +489,7 @@ async def test_runner_preserves_caller_cancellation_during_heartbeat_cleanup(mon
 
 async def test_sync_orchestrator_returns_success_and_logs_completion(monkeypatch, log_messages):
     state = make_state()
+    state.session_id = "business-conversation-42"
     message = external_http.ExternalHttpMessageIn(content="secret content")
 
     async def process(**_kwargs):
@@ -491,7 +506,8 @@ async def test_sync_orchestrator_returns_success_and_logs_completion(monkeypatch
     assert result["reply"] == "done"
     output = "\n".join(log_messages)
     assert 'event="completed"' in output
-    assert 'session_id="session-1"' in output
+    assert 'session_id="business-conversation-42"' in output
+    assert 'session_id="session-1"' not in output
     assert "secret content" not in output
 
 
@@ -520,6 +536,7 @@ async def test_sync_orchestrator_returns_sanitized_500(monkeypatch, log_messages
     assert json.loads(response.body) == {
         "ok": False,
         "request_id": "req-123",
+        "error_code": "processing_failed",
         "error": "Agent inference failed",
     }
     assert b"provider-internal-detail" not in response.body
@@ -657,7 +674,9 @@ async def test_route_rejects_invalid_api_key_without_logging_credentials(
     )
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid external HTTP channel API key"}
+    assert response.json()["error_code"] == "invalid_api_key"
+    assert response.json()["error"] == "Invalid external HTTP channel API key"
+    assert response.headers["x-request-id"] == response.json()["request_id"]
     output = "\n".join(log_messages)
     assert 'event="rejected"' in output
     assert "provided-private-api-key" not in output
@@ -686,7 +705,8 @@ async def test_route_rejects_invalid_hmac_without_logging_authentication_secrets
     )
 
     assert response.status_code == 401
-    assert response.json() == {"detail": "Invalid HMAC signature"}
+    assert response.json()["error_code"] == "invalid_hmac_signature"
+    assert response.json()["error"] == "Invalid HMAC signature"
     output = "\n".join(log_messages)
     assert 'event="rejected"' in output
     for secret in (
@@ -716,7 +736,8 @@ async def test_route_serializes_payload_validation_failure(monkeypatch, route_cl
     )
 
     assert response.status_code == 422
-    assert response.json()["detail"].startswith("Invalid request body:")
+    assert response.json()["error_code"] == "invalid_request_body"
+    assert response.json()["error"] == "Invalid request body"
     assert 'event="rejected"' in "\n".join(log_messages)
 
 
@@ -771,10 +792,11 @@ async def test_route_accepts_async_processing_and_serializes_response(monkeypatc
     )
     await asyncio.wait_for(model_started.wait(), timeout=1.0)
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert set(response.json()) == {"ok", "status", "request_id"}
     assert response.json()["ok"] is True
     assert response.json()["status"] == "accepted"
+    assert response.headers["x-request-id"] == response.json()["request_id"]
     tasks = tuple(external_http._EXTERNAL_HTTP_BACKGROUND_TASKS)
     assert len(tasks) == 1
 
@@ -805,7 +827,7 @@ async def test_route_serializes_sanitized_500_and_redacts_provider_failure(
 
     body = response.json()
     assert response.status_code == 500
-    assert set(body) == {"ok", "request_id", "error"}
+    assert set(body) == {"ok", "request_id", "error_code", "error"}
     assert body["ok"] is False
     assert body["error"] == "Agent inference failed"
     assert provider_secret not in response.text
@@ -814,6 +836,129 @@ async def test_route_serializes_sanitized_500_and_redacts_provider_failure(
     assert provider_secret not in output
     assert "private-route-message" not in output
     assert ROUTE_API_KEY not in output
+
+
+async def test_route_converts_internal_tool_call_history_before_llm_request(
+    monkeypatch,
+    route_client,
+):
+    captured_history = None
+
+    async def reply(*_args, **kwargs):
+        nonlocal captured_history
+        captured_history = kwargs["history"]
+        return "route-reply"
+
+    tool_record = SimpleNamespace(
+        id=42,
+        role="tool_call",
+        content=json.dumps({
+            "name": "read_file",
+            "args": {"path": "notes.txt"},
+            "result": "file contents",
+        }),
+        thinking=None,
+    )
+    config = make_route_config()
+    install_route_processing_boundaries(
+        monkeypatch,
+        config,
+        reply,
+        history=[tool_record],
+    )
+
+    response = await route_client.post(
+        f"/api/channel/external-http/{ROUTE_AGENT_ID}/message",
+        headers={"authorization": f"Bearer {ROUTE_API_KEY}"},
+        json={"content": "route-message"},
+    )
+
+    assert response.status_code == 200
+    assert [message["role"] for message in captured_history] == ["assistant", "tool"]
+    assert captured_history[0]["tool_calls"][0]["id"] == "call_42"
+    assert captured_history[1]["tool_call_id"] == "call_42"
+
+
+async def test_route_persists_tool_callbacks_and_returns_safe_summary(
+    monkeypatch,
+    route_client,
+):
+    saved_tool_calls = []
+
+    async def save_tool_call(**kwargs):
+        saved_tool_calls.append(kwargs)
+
+    async def reply(*_args, **kwargs):
+        callback = kwargs["on_tool_call"]
+        await callback({
+            "name": "read_file",
+            "call_id": "call-safe-summary",
+            "args": {"path": "private.txt"},
+            "status": "running",
+        })
+        await callback({
+            "name": "read_file",
+            "call_id": "call-safe-summary",
+            "args": {"path": "private.txt"},
+            "status": "done",
+            "result": "Error: " + "private-result" * 100,
+            "reasoning_content": "private-reasoning",
+        })
+        return "route-reply"
+
+    monkeypatch.setattr(chat_session_service, "save_tool_call_log", save_tool_call)
+    config = make_route_config()
+    install_route_processing_boundaries(monkeypatch, config, reply)
+
+    response = await route_client.post(
+        f"/api/channel/external-http/{ROUTE_AGENT_ID}/message",
+        headers={"authorization": f"Bearer {ROUTE_API_KEY}"},
+        json={"content": "route-message"},
+    )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["tool_calls"] == [{
+        "name": "read_file",
+        "call_id": "call-safe-summary",
+        "status": "done",
+        "outcome": "error",
+    }]
+    assert body["tool_errors"] == ["read_file"]
+    assert "private.txt" not in response.text
+    assert "private-result" not in response.text
+    assert len(saved_tool_calls) == 1
+    assert saved_tool_calls[0]["tool_call_id"] == "call-safe-summary"
+    assert len(saved_tool_calls[0]["result"]) == 500
+
+
+async def test_route_returns_502_and_does_not_save_llm_error_as_assistant(
+    monkeypatch,
+    route_client,
+    log_messages,
+):
+    provider_secret = "private-upstream-provider-response"
+
+    async def reply(*_args, **_kwargs):
+        return f"[LLM Error] HTTP 400: {provider_secret}"
+
+    config = make_route_config()
+    session = install_route_processing_boundaries(monkeypatch, config, reply)
+
+    response = await route_client.post(
+        f"/api/channel/external-http/{ROUTE_AGENT_ID}/message",
+        headers={"authorization": f"Bearer {ROUTE_API_KEY}"},
+        json={"content": "private-route-message"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["ok"] is False
+    assert response.json()["error_code"] == "upstream_llm_error"
+    assert response.json()["error"] == "Upstream model request failed"
+    assert [message.role for message in session.added] == ["user"]
+    assert provider_secret not in response.text
+    assert provider_secret not in "\n".join(log_messages)
+    assert 'event="completed"' not in "\n".join(log_messages)
 
 
 async def test_route_serializes_sanitized_504_and_cancels_model(monkeypatch, route_client, log_messages):
@@ -843,7 +988,7 @@ async def test_route_serializes_sanitized_504_and_cancels_model(monkeypatch, rou
 
     body = response.json()
     assert response.status_code == 504
-    assert set(body) == {"ok", "request_id", "error"}
+    assert set(body) == {"ok", "request_id", "error_code", "error"}
     assert body["ok"] is False
     assert body["error"] == "Agent processing timed out"
     assert requested_timeouts == [120]
@@ -879,7 +1024,7 @@ async def test_route_redacts_configuration_secrets_from_sanitized_500(
 
     body = response.json()
     assert response.status_code == 500
-    assert set(body) == {"ok", "request_id", "error"}
+    assert set(body) == {"ok", "request_id", "error_code", "error"}
     assert body["ok"] is False
     assert body["error"] == "Internal processing failed"
     output = "\n".join(log_messages)
@@ -887,3 +1032,149 @@ async def test_route_redacts_configuration_secrets_from_sanitized_500(
     for secret in (*configuration_secrets, ROUTE_API_KEY, "private-route-message"):
         assert secret not in response.text
         assert secret not in output
+
+
+def test_message_validation_normalizes_identifiers_and_rejects_blank_values():
+    message = external_http.ExternalHttpMessageIn(
+        content="  keep content spacing  ",
+        external_user_id="  business-user  ",
+        external_user_name="  Business User  ",
+        conversation_id="  order-1  ",
+    )
+
+    assert message.content == "  keep content spacing  "
+    assert message.external_user_id == "business-user"
+    assert message.external_user_name == "Business User"
+    assert message.conversation_id == "order-1"
+
+    for field, value in (
+        ("content", "   "),
+        ("external_user_id", "   "),
+        ("external_user_name", "   "),
+        ("conversation_id", "   "),
+    ):
+        payload = {"content": "hello", field: value}
+        with pytest.raises(ValueError):
+            external_http.ExternalHttpMessageIn.model_validate(payload)
+
+
+def test_message_validation_bounds_database_identifiers_and_metadata():
+    with pytest.raises(ValueError):
+        external_http.ExternalHttpMessageIn(content="hello", external_user_id="u" * 101)
+    with pytest.raises(ValueError):
+        external_http.ExternalHttpMessageIn(content="hello", external_user_name="n" * 101)
+
+    nested = "leaf"
+    for _ in range(external_http.MAX_METADATA_DEPTH + 1):
+        nested = {"child": nested}
+    with pytest.raises(ValueError):
+        external_http.ExternalHttpMessageIn(content="hello", metadata=nested)
+
+
+def test_external_conversation_key_is_bounded_and_user_scoped():
+    first = external_http._external_conversation_key("user-a", "c" * 255)
+    second = external_http._external_conversation_key("user-b", "c" * 255)
+
+    assert first != second
+    assert first == external_http._external_conversation_key("user-a", "c" * 255)
+    assert len(first) <= 200
+    assert "user-a" not in first
+    assert "c" * 20 not in first
+
+
+async def test_hmac_replay_claim_is_atomic_and_rejects_duplicate(monkeypatch):
+    class FakeRedis:
+        def __init__(self):
+            self.results = iter((True, None))
+            self.keys = []
+
+        async def set(self, key, value, *, ex, nx):
+            self.keys.append((key, value, ex, nx))
+            return next(self.results)
+
+    redis = FakeRedis()
+
+    async def get_fake_redis():
+        return redis
+
+    monkeypatch.setattr(external_http, "get_redis", get_fake_redis)
+    config = make_route_config(require_hmac=True, signing_secret="signing-secret")
+    request = SimpleNamespace(headers={"x-signature-sha256": f"sha256={'a' * 64}"})
+
+    await external_http._claim_hmac_signature(config, request)
+    with pytest.raises(HTTPException) as exc_info:
+        await external_http._claim_hmac_signature(config, request)
+
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail == "Replayed HMAC request"
+    assert redis.keys[0][2:] == (external_http.HMAC_TIMESTAMP_WINDOW_SECONDS, True)
+
+
+async def test_route_rejects_body_before_buffering_beyond_configured_limit(
+    monkeypatch,
+    route_client,
+):
+    config = make_route_config()
+    config.extra_config["max_payload_bytes"] = 1024
+    monkeypatch.setattr(
+        external_http,
+        "async_session",
+        FakeSessionFactory(FakeSession((config,))),
+    )
+
+    response = await route_client.post(
+        f"/api/channel/external-http/{ROUTE_AGENT_ID}/message",
+        headers={"authorization": f"Bearer {ROUTE_API_KEY}"},
+        content=b"x" * 1025,
+    )
+
+    assert response.status_code == 413
+    assert response.json()["error_code"] == "payload_too_large"
+
+
+async def test_route_returns_retry_headers_for_rate_and_capacity_limits(
+    monkeypatch,
+    route_client,
+):
+    config = make_route_config()
+    validation_agent = SimpleNamespace(webhook_rate_limit=5)
+
+    async def over_limit(_config):
+        return 6
+
+    monkeypatch.setattr(
+        external_http,
+        "async_session",
+        FakeSessionFactory(FakeSession((config, validation_agent))),
+    )
+    monkeypatch.setattr(external_http, "_record_and_count_hits", over_limit)
+    response = await route_client.post(
+        f"/api/channel/external-http/{ROUTE_AGENT_ID}/message",
+        headers={"authorization": f"Bearer {ROUTE_API_KEY}"},
+        json={"content": "hello"},
+    )
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "60"
+    assert response.json()["error_code"] == "rate_limit_exceeded"
+
+    async def no_capacity(_agent_id):
+        return None
+
+    async def within_limit(_config):
+        return 1
+
+    monkeypatch.setattr(
+        external_http,
+        "async_session",
+        FakeSessionFactory(FakeSession((config, validation_agent))),
+    )
+    monkeypatch.setattr(external_http, "_record_and_count_hits", within_limit)
+    monkeypatch.setattr(external_http, "_try_acquire_processing_lease", no_capacity)
+    response = await route_client.post(
+        f"/api/channel/external-http/{ROUTE_AGENT_ID}/message",
+        headers={"authorization": f"Bearer {ROUTE_API_KEY}"},
+        json={"content": "hello"},
+    )
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json()["error_code"] == "processing_capacity_exhausted"
