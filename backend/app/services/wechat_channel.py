@@ -16,9 +16,11 @@ from sqlalchemy import select
 
 from app.database import async_session
 from app.models.agent import Agent as AgentModel
-from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
-from app.models.audit import ChatMessage
 from app.models.channel_config import ChannelConfig
+from app.services.agent_runtime.channel_chat import (
+    channel_message_id,
+    enqueue_channel_chat_runtime,
+)
 from app.services.channel_session import find_or_create_channel_session
 from app.services.channel_user_service import channel_user_service
 
@@ -186,8 +188,7 @@ def _extract_wechat_text(item_list: list[dict[str, Any]] | None) -> str:
 
 
 async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], config: ChannelConfig) -> None:
-    from app.api.feishu import _call_agent_llm
-    from app.services.activity_logger import log_activity
+    from app.api.feishu import _load_agent_and_model
 
     from_user_id = str(msg.get("from_user_id") or "").strip()
     if not from_user_id or from_user_id == (config.app_id or "").strip():
@@ -230,8 +231,8 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             external_conv_id=conv_id,
             source_channel="wechat",
             first_message_title=user_text,
+            created_by_user_id=platform_user_id,
         )
-        session_conv_id = str(sess.id)
         await remember_wechat_context(
             db,
             agent_id=agent_id,
@@ -240,65 +241,35 @@ async def _process_wechat_message(agent_id: uuid.UUID, msg: dict[str, Any], conf
             conv_id=conv_id,
         )
 
-        history_r = await db.execute(
-            select(ChatMessage)
-            .where(ChatMessage.agent_id == agent_id, ChatMessage.conversation_id == session_conv_id)
-            .order_by(ChatMessage.created_at.desc())
-            .limit(agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE)
-        )
-        history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
-
-        db.add(
-            ChatMessage(
-                agent_id=agent_id,
-                user_id=platform_user_id,
-                role="user",
-                content=user_text,
-                conversation_id=session_conv_id,
-            )
-        )
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
-
-        reply_text = await _call_agent_llm(
-            db=db,
-            agent_id=agent_id,
-            user_text=user_text,
-            history=history,
-            user_id=platform_user_id,
-            session_id=session_conv_id,
-        )
-
-        token = str((config.extra_config or {}).get("bot_token") or "").strip()
-        base_url = str((config.extra_config or {}).get("baseurl") or WECHAT_ILINK_BASE_URL).strip()
-        route_tag = str((config.extra_config or {}).get("route_tag") or "").strip() or None
-        await send_wechat_text_message(
-            token=token,
-            base_url=base_url,
-            to_user_id=from_user_id,
-            context_token=context_token,
-            text=reply_text,
-            route_tag=route_tag,
-        )
-
-        db.add(
-            ChatMessage(
-                agent_id=agent_id,
-                user_id=platform_user_id,
-                role="assistant",
-                content=reply_text,
-                conversation_id=session_conv_id,
-            )
-        )
-        sess.last_message_at = datetime.now(timezone.utc)
-        await db.commit()
-
-        await log_activity(
+        _, runtime_model, _fallback_model = await _load_agent_and_model(
+            db,
             agent_id,
-            "chat_reply",
-            f"Replied to WeChat message: {reply_text[:80]}",
-            detail={"channel": "wechat", "user_text": user_text[:200], "reply": reply_text[:500]},
         )
+        external_event_id = next(
+            (
+                str(msg.get(field)).strip()
+                for field in ("message_id", "msg_id", "client_id")
+                if msg.get(field)
+            ),
+            None,
+        )
+        await enqueue_channel_chat_runtime(
+            db,
+            agent=agent_obj,
+            user=platform_user,
+            session=sess,
+            model=runtime_model,
+            content=user_text,
+            source_channel="wechat",
+            channel_delivery_target={"user_id": from_user_id},
+            message_id=channel_message_id(
+                agent_id,
+                "wechat",
+                external_event_id,
+            ),
+        )
+
+        await db.commit()
 
 
 class WeChatPollManager:
@@ -339,7 +310,7 @@ class WeChatPollManager:
             result = await db.execute(
                 select(ChannelConfig).where(
                     ChannelConfig.channel_type == "wechat",
-                    ChannelConfig.is_configured == True,
+                    ChannelConfig.is_configured.is_(True),
                 )
             )
             for cfg in result.scalars().all():

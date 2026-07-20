@@ -175,6 +175,13 @@ async def register_init(
                 detail="Username already taken. Please choose a different username.",
             )
 
+        # Reject registration if the identity exists but has no password set (SSO/synced users)
+        if identity.password_hash is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered via SSO/sync. Please use password reset to set a password, or log in via SSO.",
+            )
+
         # Verify password outside transaction
         if identity.password_hash and not await verify_password_async(data.password, identity.password_hash):
             raise HTTPException(
@@ -223,6 +230,8 @@ async def register_init(
             user.is_active = is_first_user  # Active immediately if first user
             user.email_verified = identity.email_verified
             await session.flush()
+        else:
+            user.identity = identity
 
     # 5. Generate token outside transaction
     token = create_access_token(str(user.id), user.role)

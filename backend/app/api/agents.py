@@ -206,7 +206,6 @@ async def list_templates(
             "default_skills": t.default_skills,
             "default_autonomy_policy": t.default_autonomy_policy,
             "capability_bullets": t.capability_bullets or [],
-            "has_bootstrap": bool(t.bootstrap_content),
         }
         for t in templates
     ]
@@ -1060,8 +1059,6 @@ async def delete_agent(
         "agent_activity_logs",
         "audit_logs",
         "approval_requests",
-        "chat_messages",
-        "chat_sessions",
         "agent_schedules",
         "agent_triggers",
         "channel_configs",
@@ -1074,6 +1071,18 @@ async def delete_agent(
         "daily_token_usage",
     ]
 
+    # Preserve durable conversation history while removing the deleted Agent from
+    # every active product scope. Participant is intentionally kept as a display
+    # tombstone because historical Group messages reference it for sender name.
+    required_unlinks = [
+        "UPDATE chat_messages SET agent_id = NULL WHERE agent_id = :aid",
+        "UPDATE chat_sessions SET agent_id = NULL, is_primary = false, deleted_at = COALESCE(deleted_at, now()) WHERE agent_id = :aid",
+        "UPDATE chat_sessions SET peer_agent_id = NULL, is_primary = false, deleted_at = COALESCE(deleted_at, now()) WHERE peer_agent_id = :aid",
+        "UPDATE group_members SET removed_at = COALESCE(removed_at, now()) WHERE participant_id IN (SELECT id FROM participants WHERE type = 'agent' AND ref_id = :aid)",
+    ]
+    for sql in required_unlinks:
+        await db.execute(text(sql), {"aid": agent_id})
+
     for table in cleanup_tables:
         try:
             async with db.begin_nested():
@@ -1085,7 +1094,6 @@ async def delete_agent(
     secondary_fk_cleanups = [
         "DELETE FROM task_logs WHERE task_id IN (SELECT id FROM tasks WHERE agent_id = :aid)",
         "DELETE FROM tasks WHERE agent_id = :aid",
-        "DELETE FROM chat_sessions WHERE peer_agent_id = :aid",
         "DELETE FROM gateway_messages WHERE sender_agent_id = :aid",
         "UPDATE chat_messages SET sender_agent_id = NULL WHERE sender_agent_id = :aid",
     ]
@@ -1110,16 +1118,6 @@ async def delete_agent(
     try:
         async with db.begin_nested():
             await db.execute(text("DELETE FROM plaza_posts WHERE author_id = :aid"), {"aid": str(agent_id)})
-    except Exception:
-        pass
-
-    # Clean up Participant identity
-    try:
-        async with db.begin_nested():
-            await db.execute(
-                text("DELETE FROM participants WHERE type = 'agent' AND ref_id = :aid"),
-                {"aid": agent_id},
-            )
     except Exception:
         pass
 

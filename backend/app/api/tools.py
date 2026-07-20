@@ -3,26 +3,28 @@
 import uuid
 from loguru import logger
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import String, cast, select, delete, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import get_current_user
+from app.core.permissions import can_manage_agent
 from app.database import get_db
 from app.models.tool import Tool, AgentTool
 from app.models.user import User
 from app.services.tool_config import (
-    SENSITIVE_FIELD_KEYS,
-    delete_tenant_tool_config,
     decrypt_sensitive_fields,
     encrypt_sensitive_fields,
     get_sensitive_keys,
-    get_tenant_tool_config,
     get_tool_company_config,
     mask_sensitive_fields,
     meaningful_config,
     set_tenant_tool_config,
+)
+from app.services.resource_discovery import (
+    _get_smithery_api_key,
+    get_smithery_connection_status,
 )
 
 router = APIRouter(prefix="/tools", tags=["tools"])
@@ -59,7 +61,7 @@ def _agent_visible_tool_clause(agent_tenant_id: uuid.UUID | None, assignments: d
     - explicitly assigned tools are always visible
     """
     clauses = [Tool.source == "builtin"]
-    admin_cond = (Tool.tenant_id == None)
+    admin_cond = Tool.tenant_id.is_(None)
     if agent_tenant_id:
         admin_cond = admin_cond | (Tool.tenant_id == agent_tenant_id)
     clauses.append((Tool.source == "admin") & admin_cond)
@@ -86,6 +88,46 @@ def _tool_record_visible_to_agent(
     if tool.source == "agent":
         return str(tool.id) in assignments
     return False
+
+
+def _smithery_authorization_provider(
+    tool: Tool,
+    assignment: AgentTool | None,
+) -> str | None:
+    if tool.type != "mcp" or not assignment:
+        return None
+    config = assignment.config or {}
+    if config.get("smithery_namespace") and config.get("smithery_connection_id"):
+        return "smithery"
+    return None
+
+
+async def _load_assigned_smithery_connection(
+    db: AsyncSession,
+    agent_id: uuid.UUID,
+    tool_id: uuid.UUID,
+) -> dict[str, str] | None:
+    assignment_r = await db.execute(
+        select(AgentTool).where(
+            AgentTool.agent_id == agent_id,
+            AgentTool.tool_id == tool_id,
+        )
+    )
+    assignment = assignment_r.scalar_one_or_none()
+    if not assignment:
+        return None
+
+    tool_r = await db.execute(select(Tool).where(Tool.id == tool_id))
+    tool = tool_r.scalar_one_or_none()
+    if not tool or _smithery_authorization_provider(tool, assignment) != "smithery":
+        return None
+
+    config = assignment.config or {}
+    namespace = str(config.get("smithery_namespace") or "").strip()
+    connection_id = str(config.get("smithery_connection_id") or "").strip()
+    if not namespace or not connection_id:
+        return None
+    return {"namespace": namespace, "connection_id": connection_id}
 
 
 def _resolve_target_tenant_id(current_user: User, tenant_id: str | None = None) -> uuid.UUID | None:
@@ -166,7 +208,7 @@ async def list_tools(
     target_tenant_id = _resolve_target_tenant_id(current_user, tenant_id)
     if target_tenant_id:
         from sqlalchemy import or_ as _or
-        query = query.where(_or(Tool.tenant_id == None, Tool.tenant_id == target_tenant_id))
+        query = query.where(_or(Tool.tenant_id.is_(None), Tool.tenant_id == target_tenant_id))
     result = await db.execute(query)
     tools = result.scalars().all()
     response = []
@@ -338,7 +380,7 @@ async def get_agent_tools(
     # All tools visible within this agent's tenant boundary
     all_tools_r = await db.execute(
         select(Tool)
-        .where(Tool.enabled == True, _agent_visible_tool_clause(agent_obj.tenant_id, assignments))
+        .where(Tool.enabled.is_(True), _agent_visible_tool_clause(agent_obj.tenant_id, assignments))
         .order_by(Tool.category, Tool.name)
     )
     all_tools = all_tools_r.scalars().all()
@@ -400,6 +442,7 @@ async def get_agent_tools(
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
             "mcp_server_url": t.mcp_server_url,
+            "mcp_authorization_provider": _smithery_authorization_provider(t, at),
             "source": t.source,
         })
     return result
@@ -443,6 +486,88 @@ async def update_agent_tools(
             db.add(AgentTool(agent_id=agent_id, tool_id=tool_id, enabled=u.enabled))
     await db.commit()
     return {"ok": True}
+
+
+# ─── Smithery MCP Authorization Status ─────────────────────
+@router.get(
+    "/agents/{agent_id}/mcp-tools/{tool_id}/authorization-status",
+)
+async def get_mcp_authorization_status(
+    agent_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    response: Response,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one assigned Smithery connection for an authorized manager."""
+    response.headers["Cache-Control"] = "no-store"
+    no_store_headers = {"Cache-Control": "no-store"}
+
+    try:
+        agent = await _load_agent_for_tool_scope(db, agent_id)
+        if not await can_manage_agent(db, current_user, agent):
+            raise HTTPException(
+                status_code=403,
+                detail="Agent manage permission required",
+            )
+
+        connection = await _load_assigned_smithery_connection(
+            db,
+            agent_id,
+            tool_id,
+        )
+        if not connection:
+            raise HTTPException(
+                status_code=404,
+                detail="Assigned Smithery tool not found",
+            )
+
+        api_key = await _get_smithery_api_key(agent_id)
+        if not api_key:
+            return {
+                "provider": "smithery",
+                "state": "unavailable",
+                "connected": False,
+            }
+
+        provider_status = await get_smithery_connection_status(
+            api_key,
+            connection["namespace"],
+            connection["connection_id"],
+        )
+        state = provider_status.get("state")
+        if state == "connected":
+            return {
+                "provider": "smithery",
+                "state": "connected",
+                "connected": True,
+            }
+        if state == "auth_required" and provider_status.get("authorization_url"):
+            return {
+                "provider": "smithery",
+                "state": "auth_required",
+                "connected": False,
+                "authorization_url": provider_status["authorization_url"],
+            }
+        return {
+            "provider": "smithery",
+            "state": "unavailable",
+            "connected": False,
+        }
+    except HTTPException as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=error.detail,
+            headers={**(error.headers or {}), **no_store_headers},
+        ) from error
+    except Exception:
+        # Fail closed without exposing Provider URLs, credentials, or internal
+        # exception details through an error response that a browser may cache.
+        raise HTTPException(
+            status_code=503,
+            detail="MCP authorization status unavailable",
+            headers=no_store_headers,
+        ) from None
 
 
 # ─── MCP Server Testing ────────────────────────────────────
@@ -726,7 +851,7 @@ async def get_agent_tools_with_config(
     assignments = await _load_agent_tool_assignments(db, agent_id)
     all_tools_r = await db.execute(
         select(Tool)
-        .where(Tool.enabled == True, _agent_visible_tool_clause(agent_obj2.tenant_id, assignments))
+        .where(Tool.enabled.is_(True), _agent_visible_tool_clause(agent_obj2.tenant_id, assignments))
         .order_by(Tool.category, Tool.name)
     )
     all_tools = all_tools_r.scalars().all()
@@ -796,6 +921,7 @@ async def get_agent_tools_with_config(
             "is_default": t.is_default,
             "mcp_server_name": t.mcp_server_name,
             "mcp_server_url": t.mcp_server_url,
+            "mcp_authorization_provider": _smithery_authorization_provider(t, at),
             "config_schema": t.config_schema or {},
             "global_config": masked_global,
             "agent_config": raw_agent,
@@ -868,7 +994,7 @@ async def get_category_config(
     all_cat_tools = await db.execute(
         select(Tool).where(
             Tool.category == category,
-            Tool.enabled == True,
+            Tool.enabled.is_(True),
             _agent_visible_tool_clause(agent.tenant_id, await _load_agent_tool_assignments(db, agent_id)),
         ).order_by((Tool.name != primary_tool_name) if primary_tool_name else Tool.name, Tool.name)
     )

@@ -9,10 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
-from app.core.security import get_current_user, require_role
+from app.core.security import get_current_user
 from app.database import get_db
 from app.models.schedule import AgentSchedule
 from app.models.user import User
+from app.services.heartbeat_runtime import enqueue_schedule_runtime
 from app.services.scheduler import compute_next_run
 
 router = APIRouter(prefix="/agents/{agent_id}/schedules", tags=["schedules"])
@@ -185,17 +186,28 @@ async def trigger_schedule(
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    # Fire in background
-    import asyncio
-    from app.services.scheduler import _execute_schedule
-    asyncio.create_task(_execute_schedule(sched.id, sched.agent_id, sched.instruction))
+    handle = await enqueue_schedule_runtime(
+        db,
+        agent=agent,
+        schedule_id=sched.id,
+        occurrence_id=uuid.uuid4(),
+        instruction=sched.instruction,
+    )
+    if handle is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unified Agent Runtime is not enabled for schedules",
+        )
 
-    # Update tracking
     sched.last_run_at = datetime.now(timezone.utc)
     sched.run_count = (sched.run_count or 0) + 1
     await db.flush()
 
-    return {"status": "triggered", "schedule_id": str(schedule_id)}
+    return {
+        "status": "queued",
+        "schedule_id": str(schedule_id),
+        "run_id": str(handle.run_id),
+    }
 
 
 @router.get("/{schedule_id}/history")
@@ -232,4 +244,3 @@ async def get_schedule_history(
         if len(history) >= 20:
             break
     return history
-

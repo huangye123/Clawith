@@ -67,7 +67,7 @@ async def create_task(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a new task for an agent."""
-    await check_agent_access(db, current_user, agent_id)
+    agent, _access = await check_agent_access(db, current_user, agent_id)
     task = Task(
         agent_id=agent_id,
         title=data.title,
@@ -83,13 +83,23 @@ async def create_task(
     db.add(task)
     await db.flush()
 
+    runtime_handle = None
+    if data.type == "todo":
+        from app.services.task_executor import enqueue_task_runtime
+
+        runtime_handle = await enqueue_task_runtime(
+            db,
+            task=task,
+            agent=agent,
+        )
+
     task_out = await _enrich_task_out(task, db)
 
     # Commit so the background executor can see the task in its own session
     await db.commit()
 
     # Fire background execution for todo tasks
-    if data.type == "todo":
+    if data.type == "todo" and runtime_handle is None:
         import asyncio
         from app.services.task_executor import execute_task
         asyncio.create_task(execute_task(task.id, agent_id))
@@ -130,7 +140,7 @@ async def get_task_logs(
     result = await db.execute(
         select(TaskLog).where(TaskLog.task_id == task_id).order_by(TaskLog.created_at.asc())
     )
-    return [TaskLogOut.model_validate(l) for l in result.scalars().all()]
+    return [TaskLogOut.model_validate(log) for log in result.scalars().all()]
 
 
 @router.post("/{task_id}/logs", response_model=TaskLogOut, status_code=status.HTTP_201_CREATED)
