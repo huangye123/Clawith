@@ -23,14 +23,23 @@ from app.services.agent_runtime.a2a_runtime import (
 )
 from app.services.agent_runtime.command_worker import RuntimeSessionFactory
 from app.services.agent_runtime.group_runtime_tools import (
+    GROUP_DELETE_WORKSPACE_FILE,
     GROUP_READ_TOOL_NAMES,
+    GROUP_SCOPED_WORKSPACE_TOOL_NAMES,
     GROUP_TOOL_NAMES,
     GROUP_WORKSPACE_MUTATION_TOOL_NAMES,
     GROUP_WRITE_TOOL_NAMES,
+    SCOPED_GROUP_WORKSPACE_MUTATION_TOOL_NAMES,
+    SCOPED_WORKSPACE_TOOL_NAMES,
     GroupRuntimeToolError,
     GroupRuntimeToolService,
     GroupWorkspaceReconciliationPending,
     with_group_runtime_tools,
+)
+from app.services.agent_runtime.group_at import (
+    AT_TOOL_NAME,
+    GroupAtArgumentsError,
+    parse_group_at_participant_ids,
 )
 from app.services.agent_runtime.node_executor import (
     RuntimeCancelSource,
@@ -66,6 +75,7 @@ from app.services.agent_runtime.tool_result_store import (
     ToolResultReconciler,
     ToolResultStore,
 )
+from app.services.autonomy_service import autonomy_service
 from app.services.agent_tools import (
     agentbay_run_scope_id,
     execute_builtin_tool_outcome,
@@ -448,6 +458,114 @@ def _is_group_agent_run(state: RuntimeGraphState) -> bool:
     )
 
 
+def _is_group_scoped_workspace_call(
+    state: RuntimeGraphState,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> bool:
+    return (
+        _is_group_agent_run(state)
+        and tool_name in SCOPED_WORKSPACE_TOOL_NAMES
+        and arguments.get("workspace_scope", "group") == "group"
+    )
+
+
+def _is_group_workspace_mutation_call(
+    state: RuntimeGraphState,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> bool:
+    return tool_name in GROUP_WORKSPACE_MUTATION_TOOL_NAMES or (
+        tool_name in SCOPED_GROUP_WORKSPACE_MUTATION_TOOL_NAMES
+        and _is_group_scoped_workspace_call(state, tool_name, arguments)
+    )
+
+
+def _delete_autonomy_details(
+    state: RuntimeGraphState,
+    context: RuntimeContext,
+    agent: Agent,
+    call_id: str,
+    tool_name: str,
+    arguments: Mapping[str, object],
+) -> dict | None:
+    if tool_name not in {"delete_file", GROUP_DELETE_WORKSPACE_FILE}:
+        return None
+    actor_user_id = context.actor_user_id or str(agent.creator_id)
+    runtime_scope = {
+        "tenant_id": context.tenant_id,
+        "run_id": context.run_id,
+        "session_id": context.session_id,
+        "workspace_scope": "agent",
+        "tool_call_id": call_id,
+    }
+    is_group_delete = tool_name == GROUP_DELETE_WORKSPACE_FILE or (
+        tool_name == "delete_file"
+        and _is_group_scoped_workspace_call(
+            state,
+            tool_name,
+            arguments,
+        )
+    )
+    if is_group_delete:
+        initial_input = state["snapshots"].initial_input
+        group_id = initial_input.get("group_id")
+        participant_id = initial_input.get("target_participant_id")
+        group_context = initial_input.get("group_context")
+        context_agent = (
+            group_context.get("agent")
+            if isinstance(group_context, Mapping)
+            else None
+        )
+        context_agent_id = (
+            context_agent.get("agent_id")
+            if isinstance(context_agent, Mapping)
+            else None
+        )
+        try:
+            uuid.UUID(str(group_id))
+            uuid.UUID(str(participant_id))
+            uuid.UUID(context.session_id or "")
+        except (TypeError, ValueError) as exc:
+            raise ToolExecutionError(
+                "group_tool_scope_invalid",
+                "Group delete approval scope is incomplete",
+            ) from exc
+        if context_agent_id != str(agent.id):
+            raise ToolExecutionError(
+                "group_tool_scope_invalid",
+                "Group delete approval Agent does not match the executing Agent",
+            )
+        path = arguments.get("path")
+        if not isinstance(path, str) or not path.strip():
+            raise ToolExecutionError(
+                "invalid_tool_call",
+                "delete_file requires a non-empty path",
+            )
+        workspace_path = path.replace("\\", "/").strip()
+        if workspace_path in {"", ".", "workspace", "workspace/"}:
+            raise ToolExecutionError(
+                "invalid_tool_call",
+                "delete_file must identify an item inside Group Workspace",
+            )
+        if workspace_path.startswith("workspace/"):
+            workspace_path = workspace_path.removeprefix("workspace/")
+        runtime_scope.update(
+            {
+                "workspace_scope": "group",
+                "group_id": str(group_id),
+                "actor_participant_id": str(participant_id),
+                "workspace_path": workspace_path,
+            }
+        )
+    return {
+        "tool": tool_name,
+        "args": dict(arguments),
+        "requested_by": actor_user_id,
+        "runtime_scope": runtime_scope,
+    }
+
+
 def _heartbeat_blocked_summary(
     agent: Agent,
     tool_name: str,
@@ -517,6 +635,7 @@ class RuntimeToolStepService:
                 select(Agent).where(
                     Agent.id == agent_id,
                     Agent.tenant_id == tenant_id,
+                    Agent.deleted_at.is_(None),
                 )
             )
             agent = result.scalar_one_or_none()
@@ -1041,6 +1160,110 @@ class RuntimeToolStepService:
             ),
         )
 
+    async def _delete_autonomy_gate(
+        self,
+        *,
+        state: RuntimeGraphState,
+        context: RuntimeContext,
+        agent: Agent,
+        call_id: str,
+        tool_name: str,
+        arguments: Mapping[str, object],
+    ) -> tuple[ToolExecutionOutcome | None, JsonObject | None]:
+        details = _delete_autonomy_details(
+            state,
+            context,
+            agent,
+            call_id,
+            tool_name,
+            arguments,
+        )
+        if details is None:
+            return None, None
+        try:
+            async with self._session_factory() as db:
+                async with db.begin():
+                    decision = await autonomy_service.check_and_enforce(
+                        db,
+                        agent,
+                        "delete_files",
+                        details,
+                    )
+        except Exception as exc:
+            return (
+                ToolExecutionOutcome(
+                    status="failed",
+                    result_summary=(
+                        "Workspace deletion was blocked because the autonomy "
+                        "policy check could not be completed."
+                    ),
+                    result_ref=None,
+                    error_code="tool_autonomy_check_failed",
+                    retryable=False,
+                    metadata={"error_class": type(exc).__name__},
+                ),
+                None,
+            )
+        if decision.get("allowed"):
+            return None, None
+        level = str(decision.get("level") or "unknown")
+        approval_id = decision.get("approval_id")
+        approval_status = decision.get("approval_status")
+        correlation_id = decision.get("correlation_id")
+        if (
+            level == "L3"
+            and approval_status == "pending"
+            and isinstance(approval_id, str)
+            and approval_id
+            and isinstance(correlation_id, str)
+            and correlation_id
+        ):
+            return None, {
+                "waiting_type": "user",
+                "correlation_id": correlation_id,
+                "reason": "tool_approval_required",
+                "question": (
+                    "Workspace deletion requires approval. "
+                    f"Approval ID: {approval_id}"
+                ),
+                "tool_call_id": call_id,
+                "approval_id": approval_id,
+            }
+        if (
+            level == "L3"
+            and approval_status == "rejected"
+            and isinstance(approval_id, str)
+            and approval_id
+        ):
+            return ToolExecutionOutcome(
+                status="failed",
+                result_summary=(
+                    "Workspace deletion was rejected and was not executed. "
+                    f"Approval ID: {approval_id}"
+                ),
+                result_ref=None,
+                error_code="tool_approval_rejected",
+                retryable=False,
+                metadata={
+                    "approval_id": approval_id,
+                    "autonomy_level": level,
+                },
+            ), None
+        return (
+            ToolExecutionOutcome(
+                status="failed",
+                result_summary=str(
+                    decision.get("message")
+                    or "Workspace deletion was denied by the autonomy policy."
+                ),
+                result_ref=None,
+                error_code="tool_autonomy_denied",
+                retryable=False,
+                metadata={"autonomy_level": level},
+            ),
+            None,
+        )
+
     async def execute_pending(
         self,
         state: RuntimeGraphState,
@@ -1076,7 +1299,13 @@ class RuntimeToolStepService:
                     state,
                 )
             )
+            if _is_group_agent_run(state):
+                # Historical checkpoints may still contain hidden legacy calls.
+                # Keep them executable without exposing the names to new model turns.
+                allowed_names = allowed_names | GROUP_SCOPED_WORKSPACE_TOOL_NAMES
             messages: list[JsonObject] = []
+            pending_group_at_changed = False
+            pending_group_at: JsonObject | None = None
             for index, call in enumerate(tool_calls):
                 cancel = await self._cancel_source.get_cancel(state, context)
                 if cancel is not None:
@@ -1085,10 +1314,86 @@ class RuntimeToolStepService:
                         cancel_signal=cancel,
                     )
                 call_id, tool_name, arguments = _call_fields(call)
+                if tool_name == AT_TOOL_NAME:
+                    if not _is_group_agent_run(state):
+                        raise ToolExecutionError(
+                            "group_at_unavailable",
+                            "the at tool is available only in a validated Group Agent Run",
+                        )
+                    try:
+                        participant_ids = parse_group_at_participant_ids(arguments)
+                    except GroupAtArgumentsError as exc:
+                        messages.append(
+                            _result_message(
+                                run_id=run_id,
+                                call_id=call_id,
+                                tool_name=tool_name,
+                                outcome=ToolExecutionOutcome(
+                                    status="failed",
+                                    result_summary=str(exc),
+                                    result_ref=None,
+                                    error_code="group_at_arguments_invalid",
+                                ),
+                            )
+                        )
+                        continue
+                    pending_group_at_changed = True
+                    pending_group_at = (
+                        {
+                            "participant_ids": list(participant_ids),
+                            "tool_call_id": call_id,
+                            "staged_at_model_step": int(
+                                state["lifecycle"].get("model_step_count", 0)
+                            ),
+                        }
+                        if participant_ids
+                        else None
+                    )
+                    messages.append(
+                        _result_message(
+                            run_id=run_id,
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            outcome=ToolExecutionOutcome(
+                                status="succeeded",
+                                result_summary=json.dumps(
+                                    {
+                                        "status": "staged",
+                                        "participant_count": len(participant_ids),
+                                    },
+                                    separators=(",", ":"),
+                                ),
+                                result_ref=None,
+                            ),
+                        )
+                    )
+                    continue
+                if (
+                    _is_group_agent_run(state)
+                    and tool_name in SCOPED_WORKSPACE_TOOL_NAMES
+                ):
+                    arguments = dict(arguments)
+                    arguments.setdefault("workspace_scope", "group")
                 if tool_name in _CONTROL_TOOL_NAMES or tool_name not in allowed_names:
                     raise ToolExecutionError(
                         "tool_not_enabled",
                         f"tool {tool_name!r} is not enabled for this Agent",
+                    )
+                autonomy_outcome, approval_wait = (
+                    await self._delete_autonomy_gate(
+                        state=state,
+                        context=context,
+                        agent=agent,
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        arguments=arguments,
+                    )
+                )
+                if approval_wait is not None:
+                    return ToolStepResult(
+                        messages=tuple(messages),
+                        waiting_request=approval_wait,
+                        pending_tool_calls=tool_calls[index:],
                     )
                 policy = _policy(tool_name)
                 lease_owner = _tool_execution_lease_owner(
@@ -1243,7 +1548,11 @@ class RuntimeToolStepService:
                             defer_without_attempt=True,
                         )
                     if (
-                        tool_name in GROUP_WORKSPACE_MUTATION_TOOL_NAMES
+                        _is_group_workspace_mutation_call(
+                            state,
+                            tool_name,
+                            arguments,
+                        )
                         and reservation.execution.status == "started"
                     ):
                         takeover = await self._takeover_for_reconciliation(
@@ -1344,6 +1653,24 @@ class RuntimeToolStepService:
                         ),
                         pending_tool_calls=tool_calls[index:],
                     )
+
+                if autonomy_outcome is not None:
+                    outcome = await self._settle_outcome(
+                        tenant_id=tenant_id,
+                        reservation=reservation,
+                        lease_owner=lease_owner,
+                        policy=policy,
+                        outcome=autonomy_outcome,
+                    )
+                    messages.append(
+                        _result_message(
+                            run_id=run_id,
+                            call_id=call_id,
+                            tool_name=tool_name,
+                            outcome=outcome,
+                        )
+                    )
+                    continue
 
                 canonical_cross_space_action = builtin_cross_space_action(tool_name)
                 if (
@@ -1511,6 +1838,33 @@ class RuntimeToolStepService:
                                 tool_name,
                                 arguments,
                             )
+                    elif _is_group_scoped_workspace_call(
+                        state,
+                        tool_name,
+                        arguments,
+                    ):
+                        if tool_name in SCOPED_GROUP_WORKSPACE_MUTATION_TOOL_NAMES:
+                            raw_result = (
+                                await self._group_tool_service.execute_scoped_workspace_tool(
+                                    state,
+                                    context,
+                                    agent,
+                                    tool_name,
+                                    arguments,
+                                    operation_id=reservation.execution.id,
+                                    lease_owner=lease_owner,
+                                )
+                            )
+                        else:
+                            raw_result = (
+                                await self._group_tool_service.execute_scoped_workspace_tool(
+                                    state,
+                                    context,
+                                    agent,
+                                    tool_name,
+                                    arguments,
+                                )
+                            )
                     else:
                         agentbay_run_token = None
                         if tool_name.startswith("agentbay_"):
@@ -1591,7 +1945,11 @@ class RuntimeToolStepService:
                             outcome=proposed_outcome,
                         )
                     except Exception as exc:
-                        if tool_name in GROUP_WORKSPACE_MUTATION_TOOL_NAMES:
+                        if _is_group_workspace_mutation_call(
+                            state,
+                            tool_name,
+                            arguments,
+                        ):
                             raise GroupWorkspaceReconciliationPending(
                                 "Group workspace ledger settlement requires reconciliation"
                             ) from exc
@@ -1635,7 +1993,11 @@ class RuntimeToolStepService:
                         outcome=outcome,
                     )
                 )
-            return ToolStepResult(messages=tuple(messages))
+            return ToolStepResult(
+                messages=tuple(messages),
+                pending_group_at_changed=pending_group_at_changed,
+                pending_group_at=pending_group_at,
+            )
         except (
             GroupWorkspaceReconciliationPending,
             RetryableToolNodeError,

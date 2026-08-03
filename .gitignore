@@ -36,6 +36,8 @@ _agents/
 
 # Internal docs
 docs/
+/RELEASE_NOTES.md
+/.coaligneignore
 !deploy/docs/
 !deploy/docs/**
 .agents/rules/deploy.md

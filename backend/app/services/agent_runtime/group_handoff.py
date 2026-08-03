@@ -1,7 +1,7 @@
 """Terminal public-mention handoff for native Group Agent Runs.
 
-The model submits participant IDs through the shared ``finish`` tool.  This
-module validates every target before the source Run can become terminal, freezes
+The model stages participant IDs through the Group-only ``at`` tool. This
+module validates the staged targets and final Assistant response, then freezes
 one immutable delivery intent, and later applies that exact intent inside the
 ordinary Runtime delivery transaction.
 """
@@ -395,8 +395,8 @@ def _source_run_matches(
         or source_run.system_role is not None
         or source_run.runtime_type != "langgraph"
         or source_run.runtime_thread_id != str(source_run.id)
-        # Group start acknowledgement may already be delivered while the Run
-        # remains active.  This projection is not a Runtime lifecycle state.
+        # Historical Runs may already have delivered the retired start ACK;
+        # current Runs remain pending until waiting or terminal delivery.
         or source_run.delivery_status not in {"pending", "delivered"}
     ):
         raise GroupAgentHandoffError(
@@ -517,6 +517,17 @@ async def _validate_targets(
             "Group mention resolution did not preserve the frozen participant order",
             repairable=True,
         )
+    self_targets = [
+        mention.participant_id
+        for mention in resolved
+        if mention.agent is not None and mention.agent.id == source_agent_id
+    ]
+    if self_targets:
+        raise GroupAgentHandoffError(
+            "group_handoff_self_target",
+            "An Agent cannot create a public handoff to itself",
+            repairable=True,
+        )
     for mention in resolved:
         assert mention.agent is not None
         if not _target_budget_available(mention.agent, now=clock):
@@ -598,7 +609,7 @@ async def preflight_group_agent_handoff(
     if state["lifecycle"].get("status") != "running":
         raise GroupAgentHandoffError(
             "group_handoff_source_invalid",
-            "A handoff finish may be submitted only by a running Group Agent Run",
+            "A Group handoff may be submitted only by a running Group Agent Run",
             repairable=False,
         )
     tenant_id = _context_uuid(context.tenant_id, field="tenant_id")

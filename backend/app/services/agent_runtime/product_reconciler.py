@@ -10,6 +10,7 @@ import uuid
 
 from sqlalchemy import and_, or_, select
 
+from app.core.logging_config import set_trace_id
 from app.models.agent_run import AgentRun
 from app.models.agent_run_command import AgentRunCommand
 from app.models.agent_tool_execution import AgentToolExecution
@@ -22,6 +23,7 @@ from app.services.agent_runtime.command_worker import (
 )
 from app.services.agent_runtime.group_runtime_tools import (
     GROUP_WORKSPACE_MUTATION_TOOL_NAMES,
+    SCOPED_GROUP_WORKSPACE_MUTATION_TOOL_NAMES,
     GroupRuntimeToolService,
     GroupWorkspaceReconciliationPending,
 )
@@ -141,8 +143,19 @@ class RuntimeProductReconciler:
                         & (ChatSession.id == AgentRun.session_id),
                     )
                     .where(
-                        AgentToolExecution.tool_name.in_(
-                            GROUP_WORKSPACE_MUTATION_TOOL_NAMES
+                        or_(
+                            AgentToolExecution.tool_name.in_(
+                                GROUP_WORKSPACE_MUTATION_TOOL_NAMES
+                            ),
+                            and_(
+                                AgentToolExecution.tool_name.in_(
+                                    SCOPED_GROUP_WORKSPACE_MUTATION_TOOL_NAMES
+                                ),
+                                AgentToolExecution.sanitized_arguments[
+                                    "workspace_scope"
+                                ].astext
+                                == "group",
+                            ),
                         ),
                         or_(
                             and_(
@@ -292,7 +305,11 @@ class RuntimeProductReconciler:
                         "operation": (
                             "write"
                             if candidate.execution.tool_name
-                            == "group_write_workspace_file"
+                            in {
+                                "group_write_workspace_file",
+                                "write_file",
+                                "edit_file",
+                            }
                             else "delete"
                         ),
                     },
@@ -340,6 +357,9 @@ class RuntimeProductReconciler:
         if candidate is None:
             return ProductReconcileResult(status="idle")
         run, command = candidate
+        # Product retries must retain the same trace as the original durable
+        # Command, including after a process restart or a new daemon iteration.
+        set_trace_id(command.id.hex[:12])
         run_record = runtime_run_record(run)
         command_record = runtime_command_record(command)
         checkpoint = None

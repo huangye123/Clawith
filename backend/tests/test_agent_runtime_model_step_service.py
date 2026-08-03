@@ -1,8 +1,10 @@
 """Runtime model-step adapter tests."""
 
+import base64
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+import json
 from unittest.mock import AsyncMock, patch
 import uuid
 
@@ -14,6 +16,10 @@ from app.services.agent_runtime.context_builder import RuntimeContextBuild
 from app.services.agent_runtime.group_handoff import GroupAgentHandoffIntent
 from app.services.agent_runtime.group_handoff import GroupAgentHandoffError
 from app.services.agent_runtime.model_step_service import RuntimeModelStepService
+from app.services.agent_runtime.model_step_service import RuntimeModelCallError
+from app.services.agent_runtime.model_step_service import _group_mention_mismatches
+from app.services.agent_runtime.model_step_service import _message_token_counter
+from app.services.agent_runtime.model_step_service import _prompt_messages
 from app.services.agent_runtime.model_step_service import _visible_mention_names
 from app.services.agent_runtime.state import (
     RunInputSnapshots,
@@ -24,6 +30,13 @@ from app.services.agent_runtime.state import (
 from app.services.llm.single_step import LLMCompletionStep
 from app.services.llm.finish import FINISH_PROTOCOL_REMINDER
 from app.services.token_tracker import TokenUsage
+
+
+_TINY_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/"
+    "x8AAusB9Wl2ZQAAAABJRU5ErkJggg=="
+)
+_TINY_PNG_DATA_URL = f"data:image/png;base64,{_TINY_PNG_BASE64}"
 
 
 class _Result:
@@ -50,9 +63,22 @@ class _DB:
 
 
 def _session_factory(model: LLMModel, agent: Agent):
+    calls = 0
+
     @asynccontextmanager
     async def factory():
-        yield _DB(model, agent)
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield _DB(model, agent)
+            return
+
+        class _NoFallbackDB:
+            async def execute(self, statement):
+                del statement
+                return _Result()
+
+        yield _NoFallbackDB()
 
     return factory
 
@@ -73,9 +99,12 @@ def _failover_session_factory(
             return
 
         class _FallbackDB:
+            def __init__(self) -> None:
+                self.results = iter((_Result(), _Result([fallback])))
+
             async def execute(self, statement):
                 del statement
-                return _Result([fallback])
+                return next(self.results)
 
         yield _FallbackDB()
 
@@ -226,6 +255,67 @@ def _runtime_data_message(messages):
     return matches[0]
 
 
+def test_prompt_messages_compatibly_parse_legacy_image_checkpoint() -> None:
+    marker = f"[image_data:{_TINY_PNG_DATA_URL}] Inspect it"
+    build = _build(
+        current_run={"run_id": str(uuid.uuid4()), "goal": "Inspect"},
+        recent_session_messages_snapshot=(),
+        recent_thread_messages=(
+            {
+                "id": "current-image",
+                "role": "user",
+                "content": marker,
+                "runtime_input": "current",
+            },
+        ),
+        initial_input={
+            "message_id": "current-image",
+            "input_content": marker,
+        },
+    )
+
+    messages = _prompt_messages(
+        static_prompt="Static",
+        dynamic_prompt="Dynamic",
+        build=build,
+    )
+
+    assert messages[-1].content == [
+        {
+            "type": "image_url",
+            "image_url": {"url": _TINY_PNG_DATA_URL},
+        },
+        {"type": "text", "text": "Inspect it"},
+    ]
+
+
+def test_message_budget_does_not_treat_large_base64_as_text_tokens() -> None:
+    padded_png = base64.b64encode(
+        base64.b64decode(_TINY_PNG_BASE64) + b"x" * (1024 * 1024)
+    ).decode("ascii")
+    small = _message_token_counter(
+        [
+            {
+                "role": "user",
+                "content": f"[image_data:{_TINY_PNG_DATA_URL}] inspect",
+            }
+        ]
+    )
+    large = _message_token_counter(
+        [
+            {
+                "role": "user",
+                "content": (
+                    f"[image_data:data:image/png;base64,{padded_png}] inspect"
+                ),
+            }
+        ]
+    )
+
+    assert large < 500
+    assert abs(large - small) < 10
+
+
 def _context(state: RuntimeGraphState) -> RuntimeContext:
     registry = state["registry"]
     return RuntimeContext(
@@ -283,23 +373,24 @@ def _failover_service(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("supports_tool_calling", "error_code"),
-    [
-        (None, "model_tool_calling_unverified"),
-        (False, "model_tool_calling_unsupported"),
-    ],
-)
-async def test_agent_model_step_fails_closed_before_provider_call(
+@pytest.mark.parametrize("supports_tool_calling", [None, False])
+async def test_agent_model_step_calls_saved_model_without_verified_tool_calling(
     supports_tool_calling: bool | None,
-    error_code: str,
 ) -> None:
     tenant_id = uuid.uuid4()
     model = _model(tenant_id)
     model.supports_tool_calling = supports_tool_calling
     agent = _agent(tenant_id)
     state = _state(tenant_id, model, agent)
-    completion = AsyncMock()
+    completion = AsyncMock(
+        return_value=LLMCompletionStep(
+            content="Completed with the saved model.",
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=20),
+        )
+    )
 
     result = await _service(
         model,
@@ -308,9 +399,9 @@ async def test_agent_model_step_fails_closed_before_provider_call(
         completion,
     ).complete_once(state, _context(state))
 
-    assert result.intent == "error"
-    assert result.error["code"] == error_code
-    completion.assert_not_awaited()
+    assert result.intent == "finish"
+    assert result.finish_content == "Completed with the saved model."
+    completion.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -357,7 +448,7 @@ async def test_normal_tool_proposal_is_stable_and_does_not_execute_in_model_step
     assert result.assistant_message["reasoning_content"] == "inspect"
     assert len(calls) == 1
     tool_names = {tool["function"]["name"] for tool in calls[0][2]["tools"]}
-    assert tool_names == {"read_file", "finish", "wait"}
+    assert tool_names == {"read_file", "wait"}
     assert calls[0][1][0].role == "system"
     assert "Earlier decision from the pending compact zone" in str(
         _runtime_data_message(calls[0][1]).content
@@ -366,6 +457,37 @@ async def test_normal_tool_proposal_is_stable_and_does_not_execute_in_model_step
     assert calls[0][1][-1].content == "Please inspect the file"
     assert len(builder.calls) == 2
     assert builder.calls[1]["run_message_token_budget"] > 0
+
+
+@pytest.mark.asyncio
+async def test_invalid_write_file_arguments_request_three_protocol_repairs() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content="",
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction="Retry write_file with valid JSON.",
+            usage=TokenUsage(total_tokens=10),
+            retry_tool_name="write_file",
+        )
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "text"
+    assert result.repair_code == "invalid_tool_call"
+    assert result.repair_tool_name == "write_file"
+    assert result.assistant_message is None
 
 
 @pytest.mark.asyncio
@@ -666,8 +788,81 @@ async def test_empty_plain_text_still_uses_one_bounded_protocol_repair() -> None
     ).complete_once(state, _context(state))
 
     assert result.intent == "text"
-    assert result.repair_code == "missing_finish"
+    assert result.repair_code == "empty_output"
     assert result.finish_content is None
+
+
+@pytest.mark.asyncio
+async def test_truncated_plain_text_is_not_treated_as_a_final_candidate() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content="Partial answer that hit the token limit",
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+            finish_reason="length",
+        )
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "text"
+    assert result.repair_code == "incomplete_output"
+    assert result.finish_content is None
+    assert "truncated" in (result.repair_instruction or "").lower()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finish_reason", "error_code"),
+    [
+        ("content_filter", "model_content_filtered"),
+        ("refusal", "model_refusal"),
+        ("unknown", "model_completion_unknown"),
+        ("tool_calls", "model_completion_inconsistent"),
+    ],
+)
+async def test_abnormal_tool_free_completion_is_structured_failure(
+    finish_reason: str,
+    error_code: str,
+) -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content="Unsafe or unusable output",
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+            finish_reason=finish_reason,
+        )
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error is not None
+    assert result.error["code"] == error_code
 
 
 @pytest.mark.asyncio
@@ -1040,7 +1235,6 @@ async def test_synthetic_input_is_injected_without_enabling_agent_tools() -> Non
     assert result.intent == "finish"
     assert calls[0][0][-1].content == "Please begin onboarding."
     assert {tool["function"]["name"] for tool in calls[0][1]["tools"]} == {
-        "finish",
         "wait",
     }
 
@@ -1270,49 +1464,57 @@ async def test_group_snapshot_adds_only_current_group_tools_and_platform_rules()
         "group_read_announcement",
         "group_read_memory",
         "group_write_memory",
+    }.issubset(tool_names)
+    assert {
         "group_list_workspace",
         "group_read_workspace_file",
         "group_write_workspace_file",
         "group_delete_workspace_file",
-    }.issubset(tool_names)
+    }.isdisjoint(tool_names)
     assert "read_file" in tool_names
+    read_file = next(
+        tool for tool in calls[0][1]["tools"]
+        if tool["function"]["name"] == "read_file"
+    )
+    assert read_file["function"]["parameters"]["properties"]["workspace_scope"] == {
+        "type": "string",
+        "enum": ["agent", "group"],
+        "default": "group",
+        "description": (
+            "Select the Agent's private Workspace or the current Group Workspace."
+        ),
+    }
     assert "send_message_to_agent" in tool_names
     group_system_prompt = str(calls[0][0][0].content)
     assert "Answer only from this group" in group_system_prompt
-    assert "access only the Agent's own Workspace" in group_system_prompt
-    assert "Every path in `group_context.workspace_index`" in group_system_prompt
-    assert "not evidence that a Group Workspace path is missing" in group_system_prompt
+    assert "File tools that expose `workspace_scope`" in group_system_prompt
+    assert "Tools without that parameter retain their original scope" in group_system_prompt
+    assert "every path in `group_context.workspace_index`" in group_system_prompt
+    assert "missing from the other" in group_system_prompt
     assert "join the current group conversation" in group_system_prompt
-    assert "It is not limited to a handoff" in group_system_prompt
-    assert "call, check in with, ask, consult, involve" in group_system_prompt
     assert "must produce a new public reply now" in group_system_prompt
-    assert "regardless of topic, wording, tone, or intent" in group_system_prompt
     assert "Must this Agent answer this message in the group" in group_system_prompt
-    assert "include, but are not limited to" in group_system_prompt
     assert "Write only the business-facing words" in group_system_prompt
     assert "Never expose or explain Tool Schema" in group_system_prompt
     assert "literal `@display name`" in group_system_prompt
     assert "matching literal `@display name` makes the mention visible" in group_system_prompt
     assert "concrete question, request, or responsibility" in group_system_prompt
-    assert "Do not merely announce that you mentioned someone" in group_system_prompt
     assert "There is no separate current-group send-message tool" in group_system_prompt
     assert "first call `group_query_members`" in group_system_prompt
-    assert "exactly one `finish` call" in group_system_prompt
-    assert "all intended target IDs" in group_system_prompt
-    assert "do not narrate what you are about to do" in group_system_prompt
-    assert "do not emit another progress message" in group_system_prompt
-    assert "must directly call `finish` exactly once" in group_system_prompt
-    assert "does not send a group message and is invalid" in group_system_prompt
-    assert "repair response must be exactly one native `finish` tool call" in group_system_prompt
-    assert '"wake A and ask A to wake B"' in group_system_prompt
-    assert "this Run should mention A only" in group_system_prompt
-    assert "one child Run per mentioned participant" in group_system_prompt
-    assert "cannot add another mention target" in group_system_prompt
+    assert "then call `at`" in group_system_prompt
+    assert "After the `at` Tool Result" in group_system_prompt
+    assert "normal Assistant content" in group_system_prompt
+    assert "Do not put public content in `at`" in group_system_prompt
+    assert "one child Run per staged participant" in group_system_prompt
     assert "every intended recipient" in group_system_prompt
     assert "`send_message_to_agent` is private A2A" in group_system_prompt
-    assert "never a substitute for `finish.mention_participant_ids`" in group_system_prompt
-    assert "textual `@name` or display name" in group_system_prompt
-    assert "omit `mention_participant_ids`" in group_system_prompt
+    assert "never a substitute for `at`" in group_system_prompt
+    assert "A planned group transition must remain in this group session" in group_system_prompt
+    assert "under any `msg_type`" in group_system_prompt
+    assert "Do not perform another Agent's assigned responsibility" in group_system_prompt
+    assert "A private A2A result is not that Agent's public group reply" in group_system_prompt
+    assert "A textual `@name` is only visible text" in group_system_prompt
+    assert "omit its ID from `at.participant_ids`" in group_system_prompt
     assert "using your own role and voice" in group_system_prompt
     assert "answer only the part addressed to you" in group_system_prompt
     assert "normally finish without mentioning anyone" in group_system_prompt
@@ -1333,16 +1535,140 @@ async def test_group_snapshot_adds_only_current_group_tools_and_platform_rules()
         "agent",
         "external",
     ]
-    finish_tool = next(
-        tool for tool in calls[0][1]["tools"] if tool["function"]["name"] == "finish"
+    at_tool = next(
+        tool for tool in calls[0][1]["tools"] if tool["function"]["name"] == "at"
     )
-    assert "mention_participant_ids" in finish_tool["function"]["parameters"][
-        "properties"
-    ]
+    assert set(at_tool["function"]["parameters"]["properties"]) == {
+        "participant_ids"
+    }
+    assert "finish" not in tool_names
 
 
 @pytest.mark.asyncio
-async def test_group_finish_mentions_are_preflighted_before_becoming_finish_intent() -> None:
+async def test_group_at_with_same_response_content_routes_only_to_tool_node() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["snapshots"] = RunInputSnapshots(
+        session_context={"version": 1, "summary": "shared"},
+        session_context_version=1,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input={"group_context": {"group": {"group_id": str(uuid.uuid4())}}},
+    )
+    target_id = uuid.uuid4()
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content="Draft that must not be published yet",
+            tool_calls=(
+                {
+                    "id": "call-at",
+                    "type": "function",
+                    "function": {
+                        "name": "at",
+                        "arguments": {"participant_ids": [str(target_id)]},
+                    },
+                },
+            ),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+            finish_reason="tool_calls",
+        )
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build(initial_input=state["snapshots"].initial_input)),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "tool_calls"
+    assert result.finish_content is None
+    assert result.assistant_message is not None
+    assert result.assistant_message["content"] == "Draft that must not be published yet"
+    assert result.tool_calls[0]["function"]["name"] == "at"
+
+
+@pytest.mark.asyncio
+async def test_staged_group_at_is_preflighted_with_natural_final_response() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    target_participant_id = uuid.uuid4()
+    state["lifecycle"]["pending_group_at"] = {
+        "participant_ids": [str(target_participant_id)],
+        "tool_call_id": "at-group-handoff",
+        "staged_at_model_step": 1,
+    }
+    state["snapshots"] = RunInputSnapshots(
+        session_context={"version": 1, "summary": "shared"},
+        session_context_version=1,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input={"group_context": {"group": {"group_id": str(uuid.uuid4())}}},
+    )
+    run_id = uuid.UUID(_context(state).run_id)
+    frozen = GroupAgentHandoffIntent(
+        source_run_id=run_id,
+        source_agent_id=agent.id,
+        sender_participant_id=uuid.uuid4(),
+        group_id=uuid.uuid4(),
+        session_id=uuid.uuid4(),
+        child_parent_run_id=run_id,
+        child_root_run_id=run_id,
+        mention_participant_ids=(target_participant_id,),
+        trigger_message_id=uuid.uuid4(),
+        cutoff_created_at=datetime(2026, 7, 16, 14, 0, tzinfo=UTC),
+        idempotency_key=f"run:{run_id}:terminal:completed",
+        origin_user_id=uuid.uuid4(),
+        mode=None,
+        plan_prompt=None,
+    )
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content="My review is complete. @Target Agent please approve.",
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+            finish_reason="stop",
+        )
+
+    with (
+        patch(
+            "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+            new=AsyncMock(return_value=((), ())),
+        ),
+        patch(
+            "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
+            new=AsyncMock(return_value=frozen),
+        ) as preflight,
+    ):
+        result = await _service(
+            model,
+            agent,
+            _ContextBuilder(_build(initial_input=state["snapshots"].initial_input)),
+            complete,
+        ).complete_once(state, _context(state))
+
+    assert result.intent == "finish"
+    assert result.finish_content == "My review is complete. @Target Agent please approve."
+    assert result.finish_delivery_intent == frozen.payload()
+    assert preflight.await_count == 1
+    assert preflight.await_args.kwargs["mention_participant_ids"] == (
+        str(target_participant_id),
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_group_finish_json_is_unwrapped_before_delivery() -> None:
     tenant_id = uuid.uuid4()
     model = _model(tenant_id)
     agent = _agent(tenant_id)
@@ -1376,29 +1702,29 @@ async def test_group_finish_mentions_are_preflighted_before_becoming_finish_inte
     async def complete(*args, **kwargs):
         del args, kwargs
         return LLMCompletionStep(
-            content="",
-            tool_calls=(
+            content=json.dumps(
                 {
-                    "id": "finish-group-handoff",
-                    "type": "function",
-                    "function": {
-                        "name": "finish",
-                        "arguments": {
-                            "content": "My review is complete. Please approve.",
-                            "mention_participant_ids": [str(target_participant_id)],
-                        },
-                    },
-                },
+                    "content": "@Target Agent please approve.",
+                    "mention_participant_ids": [str(target_participant_id)],
+                }
             ),
+            tool_calls=(),
             reasoning_content=None,
             retry_instruction=None,
             usage=TokenUsage(total_tokens=10),
+            finish_reason="stop",
         )
 
-    with patch(
-        "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
-        new=AsyncMock(return_value=frozen),
-    ) as preflight:
+    with (
+        patch(
+            "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+            new=AsyncMock(return_value=((), ())),
+        ),
+        patch(
+            "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
+            new=AsyncMock(return_value=frozen),
+        ) as preflight,
+    ):
         result = await _service(
             model,
             agent,
@@ -1407,9 +1733,11 @@ async def test_group_finish_mentions_are_preflighted_before_becoming_finish_inte
         ).complete_once(state, _context(state))
 
     assert result.intent == "finish"
-    assert result.finish_content == "My review is complete. Please approve."
+    assert result.finish_content == "@Target Agent please approve."
+    assert result.assistant_message is not None
+    assert result.assistant_message["content"] == result.finish_content
+    assert "mention_participant_ids" not in result.finish_content
     assert result.finish_delivery_intent == frozen.payload()
-    assert preflight.await_count == 1
     assert preflight.await_args.kwargs["mention_participant_ids"] == (
         str(target_participant_id),
     )
@@ -1423,7 +1751,66 @@ def test_visible_mention_names_ignore_code_links_and_longer_member_names() -> No
 
 
 @pytest.mark.asyncio
-async def test_group_finish_repairs_visible_agent_mention_without_structured_id() -> None:
+async def test_group_mention_validation_is_bidirectional() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["snapshots"] = RunInputSnapshots(
+        session_context={"version": 1},
+        session_context_version=1,
+        recent_session_messages=(),
+        related_run_summaries=(),
+        initial_input={"group_context": {"group": {"group_id": str(uuid.uuid4())}}},
+    )
+    alice_id = uuid.uuid4()
+    bob_id = uuid.uuid4()
+
+    class _Participants:
+        def all(self):
+            return [(alice_id, "Alice"), (bob_id, "Bob")]
+
+    db = AsyncMock()
+    db.execute.return_value = _Participants()
+
+    missing_structured, missing_visible = await _group_mention_mismatches(
+        db,
+        state=state,
+        content="@Alice please review.",
+        mention_participant_ids=(str(bob_id),),
+    )
+
+    assert missing_structured == ("Alice",)
+    assert missing_visible == ("Bob",)
+
+
+@pytest.mark.asyncio
+async def test_group_mention_validation_fails_closed_for_invalid_group_scope() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    state["snapshots"] = RunInputSnapshots(
+        session_context={"version": 1},
+        session_context_version=1,
+        recent_session_messages=(),
+        related_run_summaries=(),
+        initial_input={"group_context": {"group": {"group_id": "invalid"}}},
+    )
+
+    with pytest.raises(RuntimeModelCallError) as raised:
+        await _group_mention_mismatches(
+            AsyncMock(),
+            state=state,
+            content="@Alice please review.",
+            mention_participant_ids=(),
+        )
+
+    assert raised.value.code == "invalid_group_scope"
+
+
+@pytest.mark.asyncio
+async def test_group_response_repairs_visible_agent_mention_without_staged_id() -> None:
     tenant_id = uuid.uuid4()
     model = _model(tenant_id)
     agent = _agent(tenant_id)
@@ -1439,26 +1826,18 @@ async def test_group_finish_repairs_visible_agent_mention_without_structured_id(
     async def complete(*args, **kwargs):
         del args, kwargs
         return LLMCompletionStep(
-            content="",
-            tool_calls=(
-                {
-                    "id": "finish-visible-mention-without-id",
-                    "type": "function",
-                    "function": {
-                        "name": "finish",
-                        "arguments": {"content": "@Target Agent please reply."},
-                    },
-                },
-            ),
+            content="@Target Agent please reply.",
+            tool_calls=(),
             reasoning_content=None,
             retry_instruction=None,
             usage=TokenUsage(total_tokens=10),
+            finish_reason="stop",
         )
 
     with (
         patch(
-            "app.services.agent_runtime.model_step_service._missing_visible_group_mentions",
-            new=AsyncMock(return_value=("Target Agent",)),
+            "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+            new=AsyncMock(return_value=(("Target Agent",), ())),
         ),
         patch(
             "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
@@ -1473,11 +1852,66 @@ async def test_group_finish_repairs_visible_agent_mention_without_structured_id(
         ).complete_once(state, _context(state))
 
     assert result.intent == "text"
-    assert result.repair_code == "invalid_finish"
+    assert result.repair_code == "invalid_group_at"
     assert "@Target Agent" in (result.repair_instruction or "")
-    assert "mention_participant_ids" in (result.repair_instruction or "")
+    assert "call `at`" in (result.repair_instruction or "")
     assert result.finish_content is None
     assert result.finish_delivery_intent is None
+    preflight.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_group_response_repairs_staged_id_without_visible_mention() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+    target_id = uuid.uuid4()
+    state["lifecycle"]["pending_group_at"] = {
+        "participant_ids": [str(target_id)],
+        "tool_call_id": "call-at",
+        "staged_at_model_step": 1,
+    }
+    state["snapshots"] = RunInputSnapshots(
+        session_context={"version": 1, "summary": "shared"},
+        session_context_version=1,
+        recent_session_messages=state["snapshots"].recent_session_messages,
+        related_run_summaries=(),
+        initial_input={"group_context": {"group": {"group_id": str(uuid.uuid4())}}},
+    )
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        return LLMCompletionStep(
+            content="Please review the completed work.",
+            tool_calls=(),
+            reasoning_content=None,
+            retry_instruction=None,
+            usage=TokenUsage(total_tokens=10),
+            finish_reason="stop",
+        )
+
+    with (
+        patch(
+            "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+            new=AsyncMock(return_value=((), ("Target Agent",))),
+        ),
+        patch(
+            "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
+            new=AsyncMock(),
+        ) as preflight,
+    ):
+        result = await _service(
+            model,
+            agent,
+            _ContextBuilder(_build(initial_input=state["snapshots"].initial_input)),
+            complete,
+        ).complete_once(state, _context(state))
+
+    assert result.intent == "text"
+    assert result.repair_code == "invalid_group_at"
+    assert "@Target Agent" in (result.repair_instruction or "")
+    assert "missing from the visible" in (result.repair_instruction or "")
     preflight.assert_not_awaited()
 
 
@@ -1550,10 +1984,16 @@ async def test_group_plain_text_handoff_claim_is_repaired_without_routing_text()
             usage=TokenUsage(total_tokens=10),
         )
 
-    with patch(
-        "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
-        new=AsyncMock(),
-    ) as preflight:
+    with (
+        patch(
+            "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+            new=AsyncMock(return_value=(("Alice",), ())),
+        ),
+        patch(
+            "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
+            new=AsyncMock(),
+        ) as preflight,
+    ):
         result = await _service(
             model,
             agent,
@@ -1562,8 +2002,8 @@ async def test_group_plain_text_handoff_claim_is_repaired_without_routing_text()
         ).complete_once(state, _context(state))
 
     assert result.intent == "text"
-    assert result.repair_code == "invalid_finish"
-    assert "mention_participant_ids" in (result.repair_instruction or "")
+    assert result.repair_code == "invalid_group_at"
+    assert "call `at`" in (result.repair_instruction or "")
     assert result.finish_mention_participant_ids == ()
     assert result.finish_delivery_intent is None
     preflight.assert_not_awaited()
@@ -1606,14 +2046,20 @@ async def test_group_handoff_preflight_failure_repairs_without_finishing() -> No
             usage=TokenUsage(total_tokens=10),
         )
 
-    with patch(
-        "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
-        new=AsyncMock(
-            side_effect=GroupAgentHandoffError(
-                "group_handoff_target_invalid",
-                "target is no longer active",
-                repairable=True,
-            )
+    with (
+        patch(
+            "app.services.agent_runtime.model_step_service._group_mention_mismatches",
+            new=AsyncMock(return_value=((), ())),
+        ),
+        patch(
+            "app.services.agent_runtime.model_step_service.preflight_group_agent_handoff",
+            new=AsyncMock(
+                side_effect=GroupAgentHandoffError(
+                    "group_handoff_target_invalid",
+                    "target is no longer active",
+                    repairable=True,
+                )
+            ),
         ),
     ):
         result = await _service(
@@ -2080,8 +2526,7 @@ async def test_mixed_finish_and_tool_calls_are_repaired_before_any_tool_runs() -
     assert result.tool_calls == ()
     assert result.repair_instruction is not None
     assert "only tool call" in result.repair_instruction
-    assert result.assistant_message is not None
-    assert "tool_calls" not in result.assistant_message
+    assert result.assistant_message is None
 
 
 @pytest.mark.asyncio
@@ -2283,7 +2728,37 @@ async def test_non_retryable_primary_error_never_calls_configured_fallback() -> 
     assert result.intent == "error"
     assert result.error is not None
     assert result.error["code"] == "model_call_failed"
+    assert result.error["message"] == "Model provider request failed."
+    assert "invalid API key" not in result.error["message"]
     assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_validation_error_is_redacted_from_runtime_delivery() -> None:
+    tenant_id = uuid.uuid4()
+    model = _model(tenant_id)
+    agent = _agent(tenant_id)
+    state = _state(tenant_id, model, agent)
+
+    async def complete(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(
+            'HTTP 400: {"error":{"metadata":{"provider_name":"Cohere"},'
+            '"user_id":"private-user-id","message":"invalid request"}}'
+        )
+
+    result = await _service(
+        model,
+        agent,
+        _ContextBuilder(_build()),
+        complete,
+    ).complete_once(state, _context(state))
+
+    assert result.intent == "error"
+    assert result.error == {
+        "code": "model_call_failed",
+        "message": "Model provider rejected the request (HTTP 400).",
+    }
 
 
 @pytest.mark.asyncio

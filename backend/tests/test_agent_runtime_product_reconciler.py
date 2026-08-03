@@ -10,6 +10,7 @@ import uuid
 import pytest
 from sqlalchemy.dialects import postgresql
 
+from app.core.logging_config import get_trace_id
 from app.models.agent_run import AgentRun
 from app.models.agent_run_command import AgentRunCommand
 from app.models.agent_tool_execution import AgentToolExecution
@@ -100,10 +101,12 @@ class _Handler:
     def __init__(self, error: Exception | None = None) -> None:
         self.error = error
         self.calls = 0
+        self.trace_ids: list[str] = []
 
     async def handle(self, *, run, command, checkpoint) -> None:
         del run, command, checkpoint
         self.calls += 1
+        self.trace_ids.append(get_trace_id())
         if self.error is not None:
             raise self.error
 
@@ -162,6 +165,7 @@ async def test_applied_pending_product_sync_replays_only_idempotent_handler() ->
     assert result.status == "synced"
     assert driver.reads == [(run.id, "checkpoint-stable")]
     assert handler.calls == 1
+    assert handler.trace_ids == [command.id.hex[:12]]
     driver.execute.assert_not_awaited()
     reconciler._mark_synced.assert_awaited_once_with(command)  # type: ignore[attr-defined]
 
@@ -434,3 +438,11 @@ async def test_background_scan_reclaims_expired_started_and_delayed_unknown_rows
     assert "agent_tool_executions.lease_expires_at" in sql
     assert "agent_tool_executions.status = 'unknown'" in sql
     assert "agent_tool_executions.completed_at" in sql
+    assert "group_write_workspace_file" in sql
+    assert "group_delete_workspace_file" in sql
+    assert "write_file" in sql
+    assert "edit_file" in sql
+    assert "delete_file" in sql
+    assert "workspace_scope" in sql
+    assert "= 'group'" in sql
+    assert "chat_sessions.group_id IS NOT NULL" not in sql

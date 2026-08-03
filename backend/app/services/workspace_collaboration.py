@@ -225,6 +225,7 @@ async def _record_scoped_revision(
     actor_id: uuid.UUID | None,
     before_content: str | None,
     after_content: str | None,
+    content_hash_override: str | None = None,
     session_id: str | None = None,
     merge_user_autosave: bool = False,
 ) -> WorkspaceFileRevision | None:
@@ -245,7 +246,11 @@ async def _record_scoped_revision(
     after_content = after_content.replace("\x00", "") if after_content is not None else None
     before = before_content or ""
     after = after_content or ""
-    if before == after and operation not in {"delete", "move_source", "move_destination"}:
+    if (
+        before == after
+        and content_hash_override is None
+        and operation not in {"delete", "move_source", "move_destination"}
+    ):
         return None
 
     group_key = None
@@ -274,7 +279,7 @@ async def _record_scoped_revision(
         existing = existing_result.scalar_one_or_none()
         if existing:
             existing.after_content = after
-            existing.content_hash = content_hash(after)
+            existing.content_hash = content_hash_override or content_hash(after)
             existing.session_id = session_id or existing.session_id
             await db.flush()
             return existing
@@ -290,7 +295,7 @@ async def _record_scoped_revision(
         session_id=session_id,
         before_content=before_content,
         after_content=after_content,
-        content_hash=content_hash(after_content),
+        content_hash=content_hash_override or content_hash(after_content),
         group_key=group_key,
     )
     db.add(revision)
@@ -338,6 +343,7 @@ async def record_group_revision(
     actor_id: uuid.UUID | None,
     before_content: str | None,
     after_content: str | None,
+    content_hash_override: str | None = None,
     session_id: str | None = None,
 ) -> WorkspaceFileRevision | None:
     """Record a group-scoped file revision without creating a second history table."""
@@ -352,6 +358,7 @@ async def record_group_revision(
         actor_id=actor_id,
         before_content=before_content,
         after_content=after_content,
+        content_hash_override=content_hash_override,
         session_id=session_id,
     )
 
@@ -540,8 +547,9 @@ async def write_workspace_file(
     enforce_human_lock: bool = True,
     merge_user_autosave: bool = False,
     expected_version_token: str | None = None,
+    append: bool = False,
 ) -> WorkspaceWriteResult:
-    """Write text content, enforcing human locks for agent/system actors."""
+    """Write or append text content, enforcing human locks for agent/system actors."""
     normalized = normalize_workspace_path(path)
     if not normalized:
         return WorkspaceWriteResult(False, normalized, "Missing file path")
@@ -561,17 +569,34 @@ async def write_workspace_file(
 
     storage = get_storage_backend()
     storage_key = normalize_storage_key(f"{agent_id}/{normalized}")
+    current_version = await storage.get_version(storage_key)
+    if append and not current_version.exists:
+        return WorkspaceWriteResult(
+            False,
+            normalized,
+            f"Cannot append to missing file: {normalized}",
+        )
     local_base_available = _should_mirror_to_local_filesystem(storage)
     try:
         target = safe_agent_path(base_dir, normalized)
     except Exception:
         target = None
         local_base_available = False
-    before = await storage.read_text(storage_key, encoding="utf-8", errors="replace") if await storage.exists(storage_key) else None
+    before = (
+        await storage.read_text(storage_key, encoding="utf-8", errors="replace")
+        if current_version.exists
+        else None
+    )
+    after = f"{before or ''}{content}" if append else content
+    condition = None
+    if expected_version_token is not None:
+        condition = WriteCondition(version_token=expected_version_token)
+    elif append:
+        condition = WriteCondition(version_token=current_version.token)
     write_result = await storage.write_bytes_if_match(
         storage_key,
-        content.encode("utf-8"),
-        condition=WriteCondition(version_token=expected_version_token) if expected_version_token is not None else None,
+        after.encode("utf-8"),
+        condition=condition,
         content_type="text/plain; charset=utf-8",
     )
     if not write_result.ok:
@@ -579,7 +604,7 @@ async def write_workspace_file(
     if local_base_available and target is not None:
         target.parent.mkdir(parents=True, exist_ok=True)
         async with aiofiles.open(target, "w", encoding="utf-8") as f:
-            await f.write(content)
+            await f.write(after)
 
     revision = await record_revision(
         db,
@@ -589,14 +614,18 @@ async def write_workspace_file(
         actor_type=actor_type,
         actor_id=actor_id,
         before_content=before,
-        after_content=content,
+        after_content=after,
         session_id=session_id,
         merge_user_autosave=merge_user_autosave,
     )
     return WorkspaceWriteResult(
         True,
         normalized,
-        f"Written to {normalized} ({len(content)} chars)",
+        (
+            f"Appended to {normalized} ({len(content)} chars; {len(after)} total)"
+            if append
+            else f"Written to {normalized} ({len(content)} chars)"
+        ),
         revision_id=str(revision.id) if revision else None,
     )
 

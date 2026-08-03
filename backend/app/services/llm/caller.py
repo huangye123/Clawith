@@ -29,10 +29,17 @@ from app.services.token_tracker import (
     extract_token_usage,
     estimate_token_usage_from_chars,
 )
+from app.services.llm.multimodal_content import estimate_multimodal_tokens
+from app.services.llm.model_resolution import active_agent_model_candidates
 
-from .client import LLMError
+from .client import (
+    LLMError,
+    extract_embedded_reasoning,
+    normalize_llm_finish_reason,
+    normalize_textual_tool_protocol,
+)
 from .failover import classify_error, FailoverErrorType
-from .finish import FINISH_PROTOCOL_REMINDER, FINISH_TOOL_DEFINITION, find_finish_call
+from .finish import find_finish_call
 from .utils import LLMMessage, create_llm_client, get_max_tokens, get_model_api_key
 
 if TYPE_CHECKING:
@@ -59,13 +66,36 @@ TOOLS_REQUIRING_ARGS = frozenset({
     "send_message_to_agent", "send_feishu_message", "send_email"
 })
 
+WRITE_FILE_PROTOCOL_REPAIR_LIMIT = 3
+WRITE_FILE_PROTOCOL_REPAIR_COUNTER_KEY = "invalid_tool_call:write_file"
+WRITE_FILE_PROTOCOL_REPAIR_INSTRUCTION = (
+    "Your previous `write_file` call was not executed because `function.arguments` "
+    "was invalid JSON or was truncated. Do not retry the entire file. Retry now with "
+    "one valid JSON object containing only the first content chunk, at most 6000 "
+    "characters, and set mode=overwrite. After that tool call succeeds, continue in "
+    "later turns with exactly one smaller chunk per call using mode=append. Escape "
+    "quotes and newlines in each chunk. Do not explain; only issue the first smaller "
+    "tool call."
+)
+WRITE_FILE_PROTOCOL_FAILURE_MESSAGE = (
+    "本次文件生成未完成：write_file 工具参数无效或被截断，连续重试后仍无法执行。"
+    "请回复「重新生成」，我会基于当前对话重新尝试。"
+)
 
-def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict] | None, str | None]:
-    """Return OpenAI-compatible tool calls, or a retry instruction if args are invalid."""
+
+def _sanitize_tool_calls_for_context(
+    tool_calls: list[dict],
+) -> tuple[list[dict] | None, str | None, str | None]:
+    """Return normalized calls plus bounded-repair details for invalid arguments."""
     sanitized: list[dict] = []
     for tc in tool_calls:
         fn = tc.get("function") or {}
-        tool_name = fn.get("name") or ""
+        raw_tool_name = fn.get("name")
+        tool_name = (
+            raw_tool_name.strip()
+            if isinstance(raw_tool_name, str) and raw_tool_name.strip()
+            else ""
+        )
         raw_args = fn.get("arguments", "{}")
 
         if raw_args is None or raw_args == "":
@@ -80,22 +110,26 @@ def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict]
                     exc.msg,
                     exc.pos,
                 )
+                if tool_name == "write_file":
+                    return None, WRITE_FILE_PROTOCOL_REPAIR_INSTRUCTION, tool_name
                 return None, (
                     "Your previous tool call arguments were not valid JSON. "
                     f"The affected tool was `{tool_name or 'unknown'}`. "
                     "Retry the tool call now with `function.arguments` as one valid JSON object string. "
                     "Escape all quotes and newlines inside long HTML, CSS, JavaScript, or markdown content. "
                     "Do not explain; only retry with a valid tool call."
-                )
+                ), tool_name or None
             args_str = raw_args
         elif isinstance(raw_args, (dict, list)):
             args_str = json.dumps(raw_args, ensure_ascii=False)
         else:
+            if tool_name == "write_file":
+                return None, WRITE_FILE_PROTOCOL_REPAIR_INSTRUCTION, tool_name
             return None, (
                 "Your previous tool call arguments had an unsupported type. "
                 f"The affected tool was `{tool_name or 'unknown'}`. "
                 "Retry the tool call with `function.arguments` as one valid JSON object string."
-            )
+            ), tool_name or None
 
         new_tc = {
             "id": tc.get("id", ""),
@@ -109,7 +143,7 @@ def _sanitize_tool_calls_for_context(tool_calls: list[dict]) -> tuple[list[dict]
             new_tc["_gemini_extra"] = tc["_gemini_extra"]
         sanitized.append(new_tc)
 
-    return sanitized, None
+    return sanitized, None, None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -167,9 +201,24 @@ def _usage_from_response_or_estimate(response, api_messages: list[LLMMessage]) -
     usage = extract_token_usage(response.usage)
     if usage:
         return usage
-    round_chars = sum(len(m.content or '') if isinstance(m.content, str) else 0 for m in api_messages)
-    round_chars += len(response.content or '')
-    return estimate_token_usage_from_chars(round_chars)
+    input_tokens = estimate_multimodal_tokens(
+        [
+            {
+                "role": message.role,
+                "content": message.content,
+            }
+            for message in api_messages
+        ],
+        chars_per_token=3,
+    )
+    output_usage = estimate_token_usage_from_chars(len(response.content or ""))
+    total_tokens = input_tokens + output_usage.total_tokens
+    return TokenUsage(
+        total_tokens=total_tokens,
+        input_tokens=input_tokens,
+        output_tokens=output_usage.total_tokens,
+        estimated_tokens=total_tokens,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -223,52 +272,24 @@ async def _get_user_name(user_id) -> str | None:
 def _convert_messages_for_vision(
     api_messages: list, supports_vision: bool
 ) -> list:
-    """Convert image markers to vision format if supported, or strip them."""
-    import re as _re_v
+    """Normalize image content for vision models or strip it for text models."""
     import copy
 
-    # Deep copy to avoid modifying the original list in place
+    from app.services.llm.multimodal_content import (
+        parse_multimodal_content,
+        text_only_multimodal_content,
+    )
+
     new_messages = copy.deepcopy(api_messages)
-
-    if supports_vision:
-        # Vision format: convert image markers in strings to OpenAI Vision API list format
-        for i, msg in enumerate(new_messages):
-            if msg.role != "user" or not msg.content or not isinstance(msg.content, str):
-                continue
-            
-            content_str = msg.content
-            pattern = r'\[image_data:(data:image/[^;]+;base64,[A-Za-z0-9+/=]+)\]'
-            images = _re_v.findall(pattern, content_str)
-            
-            if not images:
-                continue
-
-            text = _re_v.sub(pattern, '', content_str).strip()
-            parts = [{"type": "image_url", "image_url": {"url": img}} for img in images]
-            if text:
-                # Per OpenAI spec, text part should come after image parts
-                parts.append({"type": "text", "text": text})
-            
-            new_messages[i] = type(msg)(role=msg.role, content=parts, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
-    else:
-        # Non-vision format: ensure content is a string for all roles, stripping image data.
-        _img_marker_pattern = r'\[image_data:data:image/[^;]+;base64,[A-Za-z0-9+/=]+\]'
-        for i, msg in enumerate(new_messages):
-            
-            if isinstance(msg.content, list):
-                # It's a list, join all text parts. This handles user messages
-                # with vision content and tool messages from vision_inject.
-                text_parts = [part.get("text", "") for part in msg.content if part.get("type") == "text"]
-                content_str = "\n".join(text_parts).strip()
-                new_messages[i] = type(msg)(role=msg.role, content=content_str, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
-
-            elif isinstance(msg.content, str) and "[image_data:" in msg.content:
-                # It's a string with image markers, strip them
-                _n_imgs = len(_re_v.findall(_img_marker_pattern, msg.content))
-                cleaned = _re_v.sub(_img_marker_pattern, '', msg.content).strip()
-                if _n_imgs > 0:
-                    cleaned += f"\n[用户发送了 {_n_imgs} 张图片，但当前模型不支持视觉，无法查看图片内容]"
-                new_messages[i] = type(msg)(role=msg.role, content=cleaned, tool_calls=msg.tool_calls, tool_call_id=msg.tool_call_id)
+    for message in new_messages:
+        content = message.content
+        if not isinstance(content, (str, list)):
+            continue
+        message.content = (
+            parse_multimodal_content(content)
+            if supports_vision
+            else text_only_multimodal_content(content)
+        )
 
     return new_messages
 
@@ -477,14 +498,6 @@ async def call_llm(
     _max_tool_rounds, _token_limit_msg = await _get_agent_config(agent_id)
     if _token_limit_msg:
         return _token_limit_msg
-    from app.services.agent_runtime.model_capabilities import (
-        ModelCapabilityError,
-        ModelCapabilityResolver,
-    )
-    try:
-        ModelCapabilityResolver.require_native_tool_calling(model)
-    except ModelCapabilityError as exc:
-        return f"[Error] {exc.code}: {exc}"
     if max_tool_rounds_override and max_tool_rounds_override < _max_tool_rounds:
         _max_tool_rounds = max_tool_rounds_override
 
@@ -514,13 +527,18 @@ async def call_llm(
 
     # Resolve the effective Tool Schema before the prompt so capability policies
     # and Skill discovery cannot advertise tools absent from this model step.
-    # `skip_tools=True` is set by the WS handler on the onboarding greeting turn;
-    # keep `finish` available so the turn still has an explicit stop signal.
+    # `skip_tools=True` is set by the WS handler on the onboarding greeting turn.
+    # Natural provider completion does not require any model-facing control tool.
     if skip_tools:
-        tools_for_llm = [FINISH_TOOL_DEFINITION]
+        tools_for_llm = []
     else:
         from app.services.agent_tools import AGENT_TOOLS
         tools_for_llm = await get_agent_tools_for_llm(agent_id) if agent_id else AGENT_TOOLS
+        tools_for_llm = [
+            tool
+            for tool in tools_for_llm
+            if ((tool.get("function") or {}).get("name") != "finish")
+        ]
     allowed_tool_names = _allowed_tool_names(tools_for_llm)
 
     from app.services.agent_context import build_agent_context
@@ -563,9 +581,14 @@ async def call_llm(
     max_tokens = get_max_tokens(model.provider, model.model, getattr(model, 'max_output_tokens', None))
     _accumulated_usage = TokenUsage()
     _unsaved_usage = TokenUsage()
-    _protocol_repairs: set[str] = set()
+    _protocol_repairs: dict[str, int] = {}
 
-    async def _protocol_violation(repair_code: str) -> str:
+    async def _protocol_violation(
+        repair_code: str,
+        *,
+        repair_tool_name: str | None = None,
+        repair_limit: int = 1,
+    ) -> str:
         if agent_id and _unsaved_usage.total_tokens > 0:
             await record_token_usage(agent_id, _unsaved_usage)
         await client.close()
@@ -574,11 +597,20 @@ async def call_llm(
             if repair_code == "missing_finish"
             else f"{repair_code}_protocol_violation"
         )
+        if repair_tool_name == "write_file":
+            return f"[Error] {error_code}: {WRITE_FILE_PROTOCOL_FAILURE_MESSAGE}"
+        repair_label = "repair" if repair_limit == 1 else "repairs"
         return (
             f"[Error] {error_code}: The model repeated the {repair_code!r} "
-            "tool protocol error after one bounded repair. Native tool calling "
-            "is not working for this request."
+            f"tool protocol error after {repair_limit} bounded {repair_label}. "
+            "Native tool calling is not working for this request."
         )
+
+    async def _completion_failure(code: str, message: str) -> str:
+        if agent_id and _unsaved_usage.total_tokens > 0:
+            await record_token_usage(agent_id, _unsaved_usage)
+        await client.close()
+        return f"[Error] {code}: {message}"
 
     # Tool-calling loop
     for round_i in range(_max_tool_rounds):
@@ -624,7 +656,8 @@ async def call_llm(
         try:
             # Use streaming API for real-time responses
             async def _buffer_chunk(_text: str) -> None:
-                # Final user-facing text must come through finish(content=...).
+                # Tool-round drafts and truncated output are not user-visible.
+                # The completed final response is emitted after stop validation.
                 return None
 
             response = await client.stream(
@@ -649,29 +682,127 @@ async def call_llm(
             await client.close()
             return f"[LLM call error] {type(e).__name__}: {str(e)[:200]}"
 
-        # Track tokens for this round
+        # Account for the provider's raw output before protocol normalization
+        # removes control envelopes from user-visible content.
         _usage_this_round = _usage_from_response_or_estimate(response, api_messages)
         _accumulated_usage.add(_usage_this_round)
         _unsaved_usage.add(_usage_this_round)
 
-        # Plain assistant text is not a stop condition. The model must finish
-        # explicitly via finish(content=...).
+        _, embedded_reasoning = extract_embedded_reasoning(
+            response.content,
+            None,
+        )
+        response.content, response.reasoning_content = extract_embedded_reasoning(
+            response.content,
+            response.reasoning_content,
+        )
+        if embedded_reasoning and on_thinking is not None:
+            await on_thinking(embedded_reasoning)
+
+        textual_retry_instruction = None
         if not response.tool_calls:
+            (
+                response.content,
+                textual_tool_calls,
+                textual_retry_instruction,
+            ) = normalize_textual_tool_protocol(
+                response.content,
+                tools_for_llm,
+            )
+            if textual_tool_calls:
+                response.tool_calls = textual_tool_calls
+
+        if textual_retry_instruction is not None:
+            if _protocol_repairs.get("invalid_textual_tool_protocol", 0) >= 1:
+                return await _protocol_violation("invalid_tool_call")
+            _protocol_repairs["invalid_textual_tool_protocol"] = 1
+            api_messages.append(
+                LLMMessage(role="user", content=textual_retry_instruction)
+            )
+            continue
+
+        # A tool-free natural stop is the final Assistant response. Explicit
+        # truncation, filtering, refusal, and unknown reasons are never delivered.
+        if not response.tool_calls:
+            content = (response.content or "").strip()
+            finish_reason = normalize_llm_finish_reason(
+                response.finish_reason,
+                response.tool_calls,
+            )
+            if finish_reason in {"stop", None} and content:
+                if agent_id and _unsaved_usage.total_tokens > 0:
+                    await record_token_usage(agent_id, _unsaved_usage)
+                if on_chunk is not None:
+                    await on_chunk(content)
+                await client.close()
+                return content
+            if finish_reason == "content_filter":
+                return await _completion_failure(
+                    "model_content_filtered",
+                    "The provider filtered the model response before completion.",
+                )
+            if finish_reason == "refusal":
+                return await _completion_failure(
+                    "model_refusal",
+                    "The provider returned a refusal.",
+                )
+            if finish_reason in {"unknown", "tool_calls"}:
+                return await _completion_failure(
+                    "model_completion_unknown",
+                    "The provider returned an unusable completion reason.",
+                )
+            repair_code = "incomplete_output" if finish_reason == "length" else "empty_output"
+            if repair_code in _protocol_repairs:
+                return await _completion_failure(
+                    "model_incomplete_output"
+                    if repair_code == "incomplete_output"
+                    else "model_empty_output",
+                    "The model repeated a truncated response after one bounded repair."
+                    if repair_code == "incomplete_output"
+                    else "The model repeated an empty response after one bounded repair.",
+                )
             if response.content:
-                api_messages.append(LLMMessage(role="assistant", content=response.content))
-            if "missing_finish" in _protocol_repairs:
-                return await _protocol_violation("missing_finish")
-            api_messages.append(LLMMessage(role="user", content=FINISH_PROTOCOL_REMINDER))
-            _protocol_repairs.add("missing_finish")
+                api_messages.append(
+                    LLMMessage(role="assistant", content=response.content)
+                )
+            api_messages.append(
+                LLMMessage(
+                    role="user",
+                    content=(
+                        "The previous response was truncated. Regenerate one complete "
+                        "final answer from the beginning."
+                        if repair_code == "incomplete_output"
+                        else "Return one complete, non-empty final answer."
+                    ),
+                )
+            )
+            _protocol_repairs[repair_code] = 1
             continue
 
         # Execute tool calls
         logger.info(f"[LLM] Round {round_i+1}: {len(response.tool_calls)} tool call(s)")
-        sanitized_tool_calls, retry_instruction = _sanitize_tool_calls_for_context(response.tool_calls)
+        sanitized_tool_calls, retry_instruction, retry_tool_name = (
+            _sanitize_tool_calls_for_context(response.tool_calls)
+        )
         if retry_instruction:
-            if "invalid_tool_call" in _protocol_repairs:
-                return await _protocol_violation("invalid_tool_call")
-            _protocol_repairs.add("invalid_tool_call")
+            repair_limit = (
+                WRITE_FILE_PROTOCOL_REPAIR_LIMIT
+                if retry_tool_name == "write_file"
+                else 1
+            )
+            repair_counter_key = (
+                WRITE_FILE_PROTOCOL_REPAIR_COUNTER_KEY
+                if retry_tool_name == "write_file"
+                else "invalid_tool_call"
+            )
+            repair_count = _protocol_repairs.get(repair_counter_key, 0)
+            if repair_count >= repair_limit:
+                return await _protocol_violation(
+                    "invalid_tool_call",
+                    repair_tool_name=retry_tool_name,
+                    repair_limit=repair_limit,
+                )
+            _protocol_repairs[repair_counter_key] = repair_count + 1
             api_messages.append(LLMMessage(role="user", content=retry_instruction))
             continue
 
@@ -683,9 +814,9 @@ async def call_llm(
                 await client.close()
                 return finish_call.content
 
-            if "invalid_finish" in _protocol_repairs:
+            if _protocol_repairs.get("invalid_finish", 0) >= 1:
                 return await _protocol_violation("invalid_finish")
-            _protocol_repairs.add("invalid_finish")
+            _protocol_repairs["invalid_finish"] = 1
 
             api_messages.append(LLMMessage(
                 role="assistant",
@@ -890,11 +1021,15 @@ async def call_agent_llm(
 ) -> str:
     """Call the agent's LLM with automatic failover support."""
     from app.models.agent import Agent
-    from app.models.llm import LLMModel
     from app.core.permissions import is_agent_expired
 
     # Load agent
-    agent_result = await db.execute(select(Agent).where(Agent.id == agent_id))
+    agent_result = await db.execute(
+        select(Agent).where(
+            Agent.id == agent_id,
+            Agent.deleted_at.is_(None),
+        )
+    )
     agent: Agent | None = agent_result.scalar_one_or_none()
     if not agent:
         return "⚠️ 数字员工未找到"
@@ -902,26 +1037,12 @@ async def call_agent_llm(
     if is_agent_expired(agent):
         return "This Agent has expired and is off duty. Please contact your admin to extend its service."
 
-    # Load primary model
-    primary_model: LLMModel | None = None
-    if agent.primary_model_id:
-        model_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.primary_model_id))
-        primary_model = model_result.scalar_one_or_none()
-
-    # Load fallback model
-    fallback_model: LLMModel | None = None
-    if agent.fallback_model_id:
-        fb_result = await db.execute(select(LLMModel).where(LLMModel.id == agent.fallback_model_id))
-        fallback_model = fb_result.scalar_one_or_none()
-
-    # Config-level fallback: primary missing -> use fallback
-    if not primary_model and fallback_model:
-        primary_model = fallback_model
-        fallback_model = None
-        logger.warning(f"[call_agent_llm] Primary model unavailable, using fallback: {primary_model.model}")
+    candidates = await active_agent_model_candidates(db, agent)
+    primary_model = candidates[0] if candidates else None
+    fallback_model = candidates[1] if len(candidates) > 1 else None
 
     if not primary_model:
-        return f"⚠️ {agent.name} 未配置 LLM 模型，请在管理后台设置。"
+        return f"⚠️ {agent.name} 没有可用的 LLM 模型，请在管理后台设置。"
 
     # Build conversation messages
     messages: list[dict] = []
