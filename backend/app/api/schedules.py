@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.dao import query_dao
 from app.core.permissions import check_agent_access, is_agent_creator, is_agent_expired
 from app.core.security import get_current_user
 from app.database import get_db
@@ -58,7 +59,7 @@ async def list_schedules(
 ):
     """List all schedules for an agent."""
     await check_agent_access(db, current_user, agent_id)
-    result = await db.execute(
+    result = await query_dao.execute(db, 
         select(AgentSchedule)
         .where(AgentSchedule.agent_id == agent_id)
         .order_by(AgentSchedule.created_at.desc())
@@ -68,7 +69,7 @@ async def list_schedules(
     creator_ids = {s.created_by for s in schedules if s.created_by}
     creator_map = {}
     if creator_ids:
-        users_result = await db.execute(select(User).where(User.id.in_(creator_ids)))
+        users_result = await query_dao.execute(db, select(User).where(User.id.in_(creator_ids)))
         creator_map = {u.id: u.username for u in users_result.scalars().all()}
     out_list = []
     for s in schedules:
@@ -104,8 +105,8 @@ async def create_schedule(
         next_run_at=next_run if data.is_enabled else None,
         created_by=current_user.id,
     )
-    db.add(sched)
-    await db.flush()
+    query_dao.add(db, sched)
+    await query_dao.flush(db)
     return ScheduleOut.model_validate(sched)
 
 
@@ -122,7 +123,7 @@ async def update_schedule(
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can manage schedules")
 
-    result = await db.execute(
+    result = await query_dao.execute(db, 
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
     )
     sched = result.scalar_one_or_none()
@@ -140,7 +141,7 @@ async def update_schedule(
         else:
             sched.next_run_at = None
 
-    await db.flush()
+    await query_dao.flush(db)
     return ScheduleOut.model_validate(sched)
 
 
@@ -156,15 +157,15 @@ async def delete_schedule(
     if not is_agent_creator(current_user, agent):
         raise HTTPException(status_code=403, detail="Only creator can manage schedules")
 
-    result = await db.execute(
+    result = await query_dao.execute(db, 
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
     )
     sched = result.scalar_one_or_none()
     if not sched:
         raise HTTPException(status_code=404, detail="Schedule not found")
 
-    await db.delete(sched)
-    await db.flush()
+    await query_dao.delete(db, sched)
+    await query_dao.flush(db)
 
 
 @router.post("/{schedule_id}/run")
@@ -179,7 +180,7 @@ async def trigger_schedule(
     if is_agent_expired(agent):
         raise HTTPException(status_code=403, detail="Agent has expired and cannot be triggered.")
 
-    result = await db.execute(
+    result = await query_dao.execute(db, 
         select(AgentSchedule).where(AgentSchedule.id == schedule_id, AgentSchedule.agent_id == agent_id)
     )
     sched = result.scalar_one_or_none()
@@ -201,7 +202,7 @@ async def trigger_schedule(
 
     sched.last_run_at = datetime.now(timezone.utc)
     sched.run_count = (sched.run_count or 0) + 1
-    await db.flush()
+    await query_dao.flush(db)
 
     return {
         "status": "queued",
@@ -220,7 +221,7 @@ async def get_schedule_history(
     """Get execution history for a schedule from activity logs."""
     await check_agent_access(db, current_user, agent_id)
     from app.models.activity_log import AgentActivityLog
-    result = await db.execute(
+    result = await query_dao.execute(db, 
         select(AgentActivityLog)
         .where(
             AgentActivityLog.agent_id == agent_id,

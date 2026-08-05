@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from app.database import async_session
+from app.dao import query_dao
 from app.models.trigger import AgentTrigger
 from app.services.trigger_runtime.keys import build_scheduled_execution_key
 from app.services.trigger_runtime.queue import enqueue_trigger_execution
@@ -32,7 +32,7 @@ def runtime_execution_payload(trigger: AgentTrigger) -> dict:
 
 
 async def enqueue_due_trigger(trigger: AgentTrigger, now: datetime) -> None:
-    async with async_session() as db:
+    async with query_dao.session() as db:
         await enqueue_trigger_execution(
             db,
             trigger=trigger,

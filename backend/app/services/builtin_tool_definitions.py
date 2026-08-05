@@ -3311,7 +3311,7 @@ _AGENTBAY_TOOL_DEFINITIONS = [
 
 _BUILTIN_TOOL_SOURCE = [
     *_BUILTIN_TOOL_SOURCE,
-    # ── AgentBay Tools ──  
+    # ── AgentBay Tools ──
     *_AGENTBAY_TOOL_DEFINITIONS,
 ]
 

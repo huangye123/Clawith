@@ -14,6 +14,7 @@ from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.dao import query_dao
 from app.database import async_session
 from app.models.agent import Agent
 from app.models.audit import ApprovalRequest, AuditLog
@@ -106,7 +107,7 @@ class AutonomyService:
             action=f"autonomy_check:{action_type}",
             details={"level": level, **details},
         )
-        db.add(audit)
+        query_dao.add(db, audit)
 
         if level == "L1":
             # Auto-execute, just log
@@ -144,8 +145,8 @@ class AutonomyService:
                 action_type=action_type,
                 details=approval_details,
             )
-            db.add(approval)
-            await db.flush()
+            query_dao.add(db, approval)
+            await query_dao.flush(db)
 
             logger.info(f"L3: Approval required for {action_type} by agent {agent.name}")
             await self._request_approval(db, agent, approval)
@@ -165,7 +166,7 @@ class AutonomyService:
         self, db: AsyncSession, approval_id: uuid.UUID, user: User, action: str
     ) -> ApprovalRequest:
         """Approve or reject a pending approval request."""
-        result = await db.execute(
+        result = await query_dao.execute(db, 
             select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
         )
         approval = result.scalar_one_or_none()
@@ -176,7 +177,7 @@ class AutonomyService:
             raise ValueError("Approval already resolved")
 
         # Permission check: only agent creator or platform admin can resolve
-        agent_result = await db.execute(select(Agent).where(Agent.id == approval.agent_id))
+        agent_result = await query_dao.execute(db, select(Agent).where(Agent.id == approval.agent_id))
         agent = agent_result.scalar_one_or_none()
         if agent and agent.creator_id != user.id and user.role != "platform_admin":
             raise ValueError("Only the agent creator or platform admin can resolve approvals")
@@ -186,7 +187,7 @@ class AutonomyService:
         approval.resolved_by = user.id
 
         # Log
-        db.add(AuditLog(
+        query_dao.add(db, AuditLog(
             user_id=user.id,
             agent_id=approval.agent_id,
             action=f"approval_{approval.status}",
@@ -269,7 +270,7 @@ class AutonomyService:
                 except (ValueError, AttributeError):
                     pass  # Invalid UUID, skip
 
-        await db.flush()
+        await query_dao.flush(db)
         return approval
 
     @staticmethod
@@ -395,13 +396,13 @@ class AutonomyService:
         )
 
         # Try Feishu notification if channel is configured
-        channel_result = await db.execute(
+        channel_result = await query_dao.execute(db, 
             select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
         )
         channel = channel_result.scalars().first()
 
         if channel and channel.app_id and channel.app_secret:
-            creator_result = await db.execute(
+            creator_result = await query_dao.execute(db, 
                 select(User).where(User.id == agent.creator_id)
             )
             creator = creator_result.scalar_one_or_none()
@@ -409,7 +410,7 @@ class AutonomyService:
                 from app.models.identity import IdentityProvider
                 from app.models.org import OrgMember
 
-                provider_r = await db.execute(
+                provider_r = await query_dao.execute(db, 
                     select(IdentityProvider).where(
                         IdentityProvider.provider_type == "feishu",
                         IdentityProvider.tenant_id == creator.tenant_id,
@@ -417,7 +418,7 @@ class AutonomyService:
                 )
                 provider = provider_r.scalar_one_or_none()
                 if provider:
-                    member_r = await db.execute(
+                    member_r = await query_dao.execute(db, 
                         select(OrgMember).where(
                             OrgMember.user_id == creator.id,
                             OrgMember.provider_id == provider.id,
@@ -450,13 +451,13 @@ class AutonomyService:
         )
 
         # Try Feishu notification
-        channel_result = await db.execute(
+        channel_result = await query_dao.execute(db, 
             select(ChannelConfig).where(ChannelConfig.agent_id == agent.id)
         )
         channel = channel_result.scalars().first()
 
         if channel and channel.app_id and channel.app_secret:
-            creator_result = await db.execute(
+            creator_result = await query_dao.execute(db, 
                 select(User).where(User.id == agent.creator_id)
             )
             creator = creator_result.scalar_one_or_none()
@@ -464,7 +465,7 @@ class AutonomyService:
                 from app.models.identity import IdentityProvider
                 from app.models.org import OrgMember
 
-                provider_r = await db.execute(
+                provider_r = await query_dao.execute(db, 
                     select(IdentityProvider).where(
                         IdentityProvider.provider_type == "feishu",
                         IdentityProvider.tenant_id == creator.tenant_id,
@@ -472,7 +473,7 @@ class AutonomyService:
                 )
                 provider = provider_r.scalar_one_or_none()
                 if provider:
-                    member_r = await db.execute(
+                    member_r = await query_dao.execute(db, 
                         select(OrgMember).where(
                             OrgMember.user_id == creator.id,
                             OrgMember.provider_id == provider.id,
